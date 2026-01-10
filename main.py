@@ -1,5 +1,12 @@
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
+import transformers.models.qwen2.modeling_qwen2 as qwen2_mod
+from cutile.ops.matmul import launch_matmul
+from cutile.modules.Qwen2MLP import MyQwen2MLP
+
+
+# 替换transformers中的Qwen2MLP
+qwen2_mod.Qwen2MLP = MyQwen2MLP
 
 model_name = "/home/menooker/models/Qwen2.5-1.5B"
 
