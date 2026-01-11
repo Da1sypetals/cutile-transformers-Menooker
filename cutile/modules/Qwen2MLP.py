@@ -2,8 +2,8 @@
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
+from cutile.ops.matmul_silu_mul import launch_matmul_silu_mul
 from cutile.ops.matmul import launch_matmul
-from cutile.ops.silu_and_mul import launch_silu_and_mul
 
 
 class MyQwen2MLP(nn.Module):
@@ -16,17 +16,7 @@ class MyQwen2MLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False, dtype=torch.float16)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False, dtype=torch.float16)
         assert config.hidden_act in ["silu"], "Unsupported activation function"
-        self.register_buffer("fused_gate_up_weight", None)
         # self.act_fn = ACT2FN[config.hidden_act]
-
-    def _initialize_fused_weights(self):
-        """Initialize the fused weight from individual gate_proj and up_proj weights."""
-        with torch.no_grad():
-            # Concatenate gate_proj.weight and up_proj.weight along output dimension
-            # gate_proj.weight: [intermediate_size, hidden_size]
-            # up_proj.weight: [intermediate_size, hidden_size]
-            # fused_weight: [2 * intermediate_size, hidden_size]
-            self.fused_gate_up_weight = torch.cat([self.gate_proj.weight, self.up_proj.weight], dim=0)
 
     def init_weights(self):
         self.gate_proj.weight.data.normal_(mean=0.0, std=0.02)
@@ -35,19 +25,13 @@ class MyQwen2MLP(nn.Module):
 
 
     def forward(self, x):
-        if self.fused_gate_up_weight is None:
-            self._initialize_fused_weights()
         batch_size = x.size(0)
         xv = x.view(-1, x.size(-1))
-        linear = torch.zeros((xv.size(0), 2*self.intermediate_size), device=x.device, dtype=torch.float16)
-        launch_matmul(xv, self.fused_gate_up_weight, linear, transb=True, act=0)
         v0 = torch.zeros((xv.size(0), self.intermediate_size), device=x.device, dtype=torch.float16)
-        launch_silu_and_mul(linear, v0)
+        launch_matmul_silu_mul(xv, self.gate_proj.weight, self.up_proj.weight, v0, approx=False)
         finalout = torch.zeros((xv.size(0), self.hidden_size), device=x.device, dtype=torch.float16)
         launch_matmul(v0, self.down_proj.weight, finalout, transb=True, act=0)
         return finalout.view(batch_size, -1, self.hidden_size)
-        # down_proj = self.down_proj(v0.view(batch_size, -1, self.intermediate_size))
-        # return down_proj
 
 
 if __name__ == "__main__":
