@@ -10,7 +10,7 @@ ACT_NONE = 0
 ConstInt = ct.Constant[int]
 
 @ct.kernel(occupancy=ct.ByTarget(sm_120=8))
-def gemv_split_k_kernel(A, B, C, LOCKS, COUNTS,
+def gemv_split_k_kernel(A, B, C, f32acc, COUNTS,
                           tn: ConstInt, tk: ConstInt,
                           SPLIT_K: ConstInt):
     GROUP_SIZE_M = 1
@@ -28,31 +28,37 @@ def gemv_split_k_kernel(A, B, C, LOCKS, COUNTS,
     split_size = ct.cdiv(num_tiles_k, SPLIT_K)
     for k in range(bidz * split_size, bidz * split_size + split_size, 1):
         a_k_offset = (ct.arange(tk, dtype=ct.int32) + k * tk)
-        a = ct.load(A, index=(bidx, k), shape=(fake_tm, tk),
-                    padding_mode=zero_pad).astype(dtype)
-        # a = ct.gather(A, (0, a_k_offset)).astype(dtype).reshape((1, tk))
-        # a = ct.broadcast_to(a, (fake_tm, tk))
+        # a = ct.load(A, index=(bidx, k), shape=(fake_tm, tk),
+        #             padding_mode=zero_pad).astype(dtype)
+        a = ct.gather(A, (0, a_k_offset)).astype(dtype).reshape((1, tk))
+        a = ct.broadcast_to(a, (fake_tm, tk))
         b = ct.load(B, index=(bidy, k), shape=(tn, tk),
                     padding_mode=zero_pad).astype(dtype)
         b = ct.transpose(b)
         sum = ct.mma(a, b, sum)
     sum = ct.extract(sum, index=(0, 0), shape=(1, tn))
     sum = ct.reshape(sum, (tn,))
-    sum = ct.astype(sum, C.dtype)
     lock_offset = ct.bid(0)
     count_offset = lock_offset
     C_offset = ct.arange(tn, dtype=ct.int32)
     C_offset = C_offset + bidy * tn
-    while ct.atomic_cas(LOCKS, lock_offset, 0, 1, memory_order=ct.MemoryOrder.ACQUIRE) == 1:
-        pass
-    count = ct.gather(COUNTS, count_offset)
-    if count == 0:
-        ct.scatter(C, (0, C_offset), sum)
-    else:
-        curr = ct.gather(C, (0, C_offset))
-        ct.scatter(C, (0, C_offset), curr + sum)
-    ct.scatter(COUNTS, count_offset, (count + 1) % SPLIT_K)
-    ct.atomic_xchg(LOCKS, lock_offset, 0, memory_order=ct.MemoryOrder.RELEASE)
+    ct.atomic_add(f32acc, (0, C_offset), sum)
+    new_count = ct.atomic_add(COUNTS, count_offset, 1)
+    if (new_count + 1) % SPLIT_K == 0:
+        result = ct.gather(f32acc, (0, C_offset))
+        ct.scatter(C, (0, C_offset), result.astype(C.dtype))
+        ct.scatter(f32acc, (0, C_offset), 0)
+        # ct.scatter(COUNTS, count_offset, 0)
+
+    # while ct.atomic_cas(f32acc, lock_offset, 0, 1, memory_order=ct.MemoryOrder.ACQUIRE) == 1:
+    #     pass
+    # count = ct.gather(COUNTS, count_offset)
+    # if count == 0:
+    #     ct.scatter(C, (0, C_offset), sum)
+    # else:
+    #     curr = ct.gather(C, (0, C_offset))
+    #     ct.scatter(C, (0, C_offset), curr + sum)
+    # ct.atomic_xchg(f32acc, lock_offset, 0, memory_order=ct.MemoryOrder.RELEASE)
 
 
 @ct.kernel(occupancy=ct.ByTarget(sm_120=8))
@@ -177,17 +183,17 @@ def test_gemv():
     import time
     import torch
     # Create input data
-    tile_m, tile_n, tile_k = 1, 64, 256
+    tile_m, tile_n, tile_k = 1, 64, 64
     split_k = 16
     M, N, K = 1, 1536, 8960
     grid = (ceil(N/tile_n), split_k, 1)
     print("Grid size:", grid)
 
-    a = torch.rand((M, K), device='cuda', dtype=torch.bfloat16)
-    b = torch.rand((N, K), device='cuda', dtype=torch.bfloat16)
-    c = torch.zeros((M, N), device='cuda', dtype=torch.bfloat16)
+    a = torch.rand((M, K), device='cuda', dtype=torch.float16)
+    b = torch.rand((N, K), device='cuda', dtype=torch.float16)
+    c = torch.zeros((M, N), device='cuda', dtype=torch.float16)
 
-    locks = torch.zeros((grid[0]), device='cuda', dtype=torch.int32)
+    f32acc = torch.zeros((M, N), device='cuda', dtype=torch.float32)
     counts = torch.zeros((grid[0]), device='cuda', dtype=torch.int32)
 
     # Launch kernel
@@ -195,7 +201,7 @@ def test_gemv():
     #benchmark this
 
     stream = torch.cuda.current_stream()
-    args = (a, b, c, locks, counts, tile_n, tile_k, split_k)
+    args = (a, b, c, f32acc, counts, tile_n, tile_k, split_k)
     ct.launch(stream,
             grid,  # 1D grid of processors
             gemv_split_k_kernel,
