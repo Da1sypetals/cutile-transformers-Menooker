@@ -18,6 +18,7 @@ def gemv_split_k_kernel(A, B, C, f32acc, COUNTS,
     N = B.shape[1]
     bidx, bidy = 0, ct.bid(0)
     bidz = ct.bid(1)
+    # pad tile A to fake_tm rows, to enable tensorcore
     fake_tm = 16
     num_tiles_k = ct.num_tiles(A, axis=1, shape=(1, tk))
     sum = ct.full((fake_tm, tn), 0, dtype=ct.float32)
@@ -27,38 +28,26 @@ def gemv_split_k_kernel(A, B, C, f32acc, COUNTS,
     dtype = ct.tfloat32 if A.dtype == ct.float32 else A.dtype
     split_size = ct.cdiv(num_tiles_k, SPLIT_K)
     for k in range(bidz * split_size, bidz * split_size + split_size, 1):
-        a_k_offset = (ct.arange(tk, dtype=ct.int32) + k * tk)
-        # a = ct.load(A, index=(bidx, k), shape=(fake_tm, tk),
-        #             padding_mode=zero_pad).astype(dtype)
-        a = ct.gather(A, (0, a_k_offset)).astype(dtype).reshape((1, tk))
-        a = ct.broadcast_to(a, (fake_tm, tk))
+        # tile a has only one effective row, of shape tk. It is not efficient to use TMA to load it.
+        a = ct.load(A, index=(bidx, k), shape=(fake_tm, tk),
+                    padding_mode=zero_pad, allow_tma=False).astype(dtype)
         b = ct.load(B, index=(bidy, k), shape=(tn, tk),
                     padding_mode=zero_pad).astype(dtype)
         b = ct.transpose(b)
         sum = ct.mma(a, b, sum)
+    # only the first row of sum is needed
     sum = ct.extract(sum, index=(0, 0), shape=(1, tn))
     sum = ct.reshape(sum, (tn,))
-    lock_offset = ct.bid(0)
-    count_offset = lock_offset
-    C_offset = ct.arange(tn, dtype=ct.int32)
-    C_offset = C_offset + bidy * tn
+    count_offset = ct.bid(0)
+    C_offset = ct.arange(tn, dtype=ct.int32) + bidy * tn
     ct.atomic_add(f32acc, (0, C_offset), sum)
     new_count = ct.atomic_add(COUNTS, count_offset, 1)
     if (new_count + 1) % SPLIT_K == 0:
         result = ct.gather(f32acc, (0, C_offset))
         ct.scatter(C, (0, C_offset), result.astype(C.dtype))
         ct.scatter(f32acc, (0, C_offset), 0)
-        # ct.scatter(COUNTS, count_offset, 0)
+        ct.scatter(COUNTS, count_offset, 0)
 
-    # while ct.atomic_cas(f32acc, lock_offset, 0, 1, memory_order=ct.MemoryOrder.ACQUIRE) == 1:
-    #     pass
-    # count = ct.gather(COUNTS, count_offset)
-    # if count == 0:
-    #     ct.scatter(C, (0, C_offset), sum)
-    # else:
-    #     curr = ct.gather(C, (0, C_offset))
-    #     ct.scatter(C, (0, C_offset), curr + sum)
-    # ct.atomic_xchg(f32acc, lock_offset, 0, memory_order=ct.MemoryOrder.RELEASE)
 
 
 @ct.kernel(occupancy=ct.ByTarget(sm_120=8))
