@@ -195,6 +195,7 @@ def test_gemv():
             grid,  # 1D grid of processors
             gemv_split_k_kernel,
             args)
+    torch.cuda.synchronize()
     start = time.time()
     for _ in range(10):
         ct.launch(stream,
@@ -206,6 +207,7 @@ def test_gemv():
     print(f"Kernel execution time: {total*1000:.4f} ms")
 
     expected = torch.matmul(a, b.T)
+    torch.cuda.synchronize()
     start = time.time()
     for _ in range(10):
         expected = torch.matmul(a, b.T)

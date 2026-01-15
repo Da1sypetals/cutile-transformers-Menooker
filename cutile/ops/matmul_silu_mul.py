@@ -62,15 +62,15 @@ def test():
     import time
     import torch
     # Create input data
-    tile_m, tile_n, tile_k = 128, 64, 64
+    tile_m, tile_n, tile_k = 64, 64, 64
     M, N, K = 4096, 4096, 4096
     grid = (ceil(M/tile_m) * ceil(N/tile_n), 1, 1)
     print("Grid size:", grid)
 
-    a = torch.rand((M, K), device='cuda', dtype=torch.bfloat16)
-    b1 = torch.rand((K, N), device='cuda', dtype=torch.bfloat16)
-    b2 = torch.rand((K, N), device='cuda', dtype=torch.bfloat16)
-    c = torch.zeros((M, N), device='cuda', dtype=torch.bfloat16)
+    a = torch.rand((M, K), device='cuda', dtype=torch.float16)
+    b1 = torch.rand((K, N), device='cuda', dtype=torch.float16)
+    b2 = torch.rand((K, N), device='cuda', dtype=torch.float16)
+    c = torch.zeros((M, N), device='cuda', dtype=torch.float16)
 
     # Launch kernel
 
@@ -82,19 +82,29 @@ def test():
             grid,  # 1D grid of processors
             matmul_silu_mul,
             args)
+    torch.cuda.synchronize()
     start = time.time()
-    for _ in range(10):
+    for _ in range(20):
         ct.launch(stream,
                 grid,  # 1D grid of processors
                 matmul_silu_mul,
                 args)
     torch.cuda.synchronize()
-    end = time.time()
-    print(f"matmul_silu_mul kernel time for 10 runs: {end - start:.4f} seconds")
+    total = (time.time() - start)/20
+    print(f"matmul_silu_mul kernel time for 10 runs: {total*1000:.4f} ms")
 
     c1 = torch.matmul(a, b1.T)
     c2 = torch.matmul(a, b2.T)
     expected = c1 * torch.sigmoid(c1) * c2
+    torch.cuda.synchronize()
+    start = time.time()
+    for _ in range(10):
+        c1 = torch.matmul(a, b1.T)
+        c2 = torch.matmul(a, b2.T)
+        expected = c1 * torch.sigmoid(c1) * c2
+    torch.cuda.synchronize()
+    total = (time.time() - start)/10
+    print(f"pytorch kernel time for 10 runs: {total*1000:.4f} ms")
     torch.testing.assert_close(c, expected)
 
     print("✓ matmul_silu_mul passed!")
