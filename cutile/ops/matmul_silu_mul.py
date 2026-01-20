@@ -49,8 +49,9 @@ def matmul_silu_mul(a, b1, b2, c, TILE_M: ct.Constant[int], TILE_N: ct.Constant[
 
 def launch_matmul_silu_mul(a: torch.Tensor, b1: torch.Tensor, b2: torch.Tensor, c: torch.Tensor, approx: bool = True):
     stream = torch.cuda.current_stream()
-    tile_m, tile_n, tile_k = 128, 64, 64
     M, N, K = a.shape[0], c.shape[1], a.shape[1]
+    
+    tile_m, tile_n, tile_k = 64, 64, 64
     grid = (ceil(M/tile_m) * ceil(N/tile_n), 1, 1)
     assert b1.shape == (N, K)
     assert b2.shape == (N, K)
@@ -110,26 +111,30 @@ def gemv_silu_mul_split_k_kernel(A, B1, B2, C, f32acc, COUNTS,
 
         ct.scatter(C, (0, C_offset), result.astype(C.dtype))
         ct.scatter(f32acc, (0, C_offset), 0)
+        ct.scatter(f32acc, (1, C_offset), 0)
         ct.scatter(COUNTS, count_offset, 0)
 
-f32acc = None
-counts = None
+# Global cache for gemv buffers to avoid reallocation on every call
+
+_gemv_f32acc = None
+_gemv_counts = None
 def launch_gemv_silu_mul(a: torch.Tensor, b1: torch.Tensor, b2: torch.Tensor, c: torch.Tensor, approx: bool = True):
+    global _gemv_f32acc, _gemv_counts
+    
     stream = torch.cuda.current_stream()
-    split_k, tile_n, tile_k = 16, 64, 64
+    split_k, tile_n, tile_k = 8, 32, 64
     M, N, K = a.shape[0], c.shape[1], a.shape[1]
     grid = (ceil(N/tile_n), split_k, 1)
     assert b1.shape == (N, K)
     assert b2.shape == (N, K)
     assert M == 1
 
-    f32acc = None
-    counts = None
-    if f32acc is None or f32acc.shape[1] < N:
-        f32acc = torch.zeros((2, N), device='cuda', dtype=torch.float32)
-    if counts is None or counts.shape[0] < grid[0]:
-        counts = torch.zeros((grid[0],), device='cuda', dtype=torch.int32)
-    args = (a, b1, b2, c, f32acc, counts, tile_n, tile_k, split_k, False)
+    # Reuse global buffers, reallocate only if needed
+    if _gemv_f32acc is None or _gemv_f32acc.shape[1] < N:
+        _gemv_f32acc = torch.zeros((2, N), device='cuda', dtype=torch.float32)
+    if _gemv_counts is None or _gemv_counts.shape[0] < grid[0]:
+        _gemv_counts = torch.zeros((grid[0],), device='cuda', dtype=torch.int32)
+    args = (a, b1, b2, c, _gemv_f32acc, _gemv_counts, tile_n, tile_k, split_k, False)
     ct.launch(stream,
             grid,
             gemv_silu_mul_split_k_kernel,
@@ -140,14 +145,14 @@ def test_matmul():
     import time
     import torch
     # Create input data
-    tile_m, tile_n, tile_k = 128, 64, 128
-    M, N, K = 4096, 4096, 4096
+    tile_m, tile_n, tile_k = 64, 64, 64
+    M, N, K = 128, 8960, 1536
     grid = (ceil(M/tile_m) * ceil(N/tile_n), 1, 1)
     print("Grid size:", grid)
 
-    a = torch.rand((M, K), device='cuda', dtype=torch.float16)
-    b1 = torch.rand((K, N), device='cuda', dtype=torch.float16)
-    b2 = torch.rand((K, N), device='cuda', dtype=torch.float16)
+    a = torch.rand((M, K), device='cuda', dtype=torch.float16)/100
+    b1 = torch.rand((N, K), device='cuda', dtype=torch.float16)/100
+    b2 = torch.rand((N, K), device='cuda', dtype=torch.float16)/100
     c = torch.zeros((M, N), device='cuda', dtype=torch.float16)
 
     # Launch kernel
@@ -163,6 +168,8 @@ def test_matmul():
     torch.cuda.synchronize()
     start = time.time()
     for _ in range(10):
+        c = torch.empty((M, N), device='cuda', dtype=torch.float16)
+        args = (a, b1, b2, c, tile_m, tile_n, tile_k, False)
         ct.launch(stream,
                 grid,  # 1D grid of processors
                 matmul_silu_mul,
@@ -171,16 +178,21 @@ def test_matmul():
     total = (time.time() - start)/10
     print(f"matmul_silu_mul kernel time for 10 runs: {total*1000:.4f} ms")
 
-    c1 = torch.matmul(a, b1.T)
-    c2 = torch.matmul(a, b2.T)
-    expected = c1 * torch.sigmoid(c1) * c2
-    torch.cuda.synchronize()
-    start = time.time()
-    for _ in range(10):
-        c1 = torch.matmul(a, b1.T)
-        c2 = torch.matmul(a, b2.T)
+    with torch.no_grad():
+        L1 = torch.nn.Linear(K, N, bias=False, device=a.device, dtype=torch.float16)
+        L1.weight[:] = b1
+        L2 = torch.nn.Linear(K, N, bias=False, device=a.device, dtype=torch.float16)
+        L2.weight[:] = b2
+        c1 = L1(a)
+        c2 = L2(a)
         expected = c1 * torch.sigmoid(c1) * c2
-    torch.cuda.synchronize()
+        torch.cuda.synchronize()
+        start = time.time()
+        for _ in range(10):
+            c1 = L1(a)
+            c2 = L2(a)
+            expected = c1 * torch.sigmoid(c1) * c2
+        torch.cuda.synchronize()
     total = (time.time() - start)/10
     print(f"pytorch kernel time for 10 runs: {total*1000:.4f} ms")
     torch.testing.assert_close(c, expected)
@@ -195,28 +207,26 @@ def test_gemv_split_k():
     import torch
     M, N, K = 1, 8960, 1536
     split_k = 16
-    a = torch.rand((M, K), device='cuda', dtype=torch.float16)
-    b1 = torch.rand((N, K), device='cuda', dtype=torch.float16)
-    b2 = torch.rand((N, K), device='cuda', dtype=torch.float16)
+    a = torch.rand((M, K), device='cuda', dtype=torch.float16)/100
+    b1 = torch.rand((N, K), device='cuda', dtype=torch.float16)/100
+    b2 = torch.rand((N, K), device='cuda', dtype=torch.float16)/100
     c = torch.zeros((M, N), device='cuda', dtype=torch.float16)
 
     stream = torch.cuda.current_stream()
-    tile_n, tile_k = 64, 64
-    grid = (ceil(N/tile_n), 1, split_k)
-    f32acc = torch.zeros((2, N), device='cuda', dtype=torch.float32)
-    counts = torch.zeros((grid[0],), device='cuda', dtype=torch.int32)
-    args = (a, b1, b2, c, f32acc, counts, tile_n, tile_k, split_k, False)
-    ct.launch(stream,
-            grid,
-            gemv_silu_mul_split_k_kernel,
-            args)
+    # tile_n, tile_k = 64, 64
+    # grid = (ceil(N/tile_n), 1, split_k)
+    # f32acc = torch.zeros((2, N), device='cuda', dtype=torch.float32)
+    # counts = torch.zeros((grid[0],), device='cuda', dtype=torch.int32)
+    # args = (a, b1, b2, c, f32acc, counts, tile_n, tile_k, split_k, False)
+    # ct.launch(stream,
+    #         grid,
+    #         gemv_silu_mul_split_k_kernel,
+    #         args)
+    launch_gemv_silu_mul(a, b1, b2, c, False)
     torch.cuda.synchronize()
     start = time.time()
     for _ in range(10):
-        ct.launch(stream,
-                grid,
-                gemv_silu_mul_split_k_kernel,
-                args)
+        launch_gemv_silu_mul(a, b1, b2, c, False)
     torch.cuda.synchronize()
     total = (time.time() - start)/10
     print(f"gemv_silu_mul_split_k kernel time for 10 runs: {total*1000:.4f} ms")

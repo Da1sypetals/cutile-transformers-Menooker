@@ -5,18 +5,34 @@ import transformers.models.qwen2.modeling_qwen2 as qwen2_mod
 from cutile.modules.Qwen2MLP import MyQwen2MLP
 
 
+model_name = "Qwen/Qwen2.5-1.5B"
 setup_logging(level="INFO")
 cutile_enabled = True
 
 if cutile_enabled:
+    print("Cutile enabled, trigger jit compilation")
     qwen2_mod.Qwen2MLP = MyQwen2MLP
+    from transformers import AutoConfig
+    config = AutoConfig.from_pretrained(model_name)
+    hidden_size = config.hidden_size  # 1536
+    intermediate_size = config.intermediate_size  # 8960
+    mlp = MyQwen2MLP(config).to('cuda')
+    batch_size = 1
+    seq_len = 128
+    
+    x = torch.randn((batch_size, seq_len, hidden_size), device='cuda', dtype=torch.float16)
+    mlp(x)
+    x = torch.randn((batch_size, 1, hidden_size), device='cuda', dtype=torch.float16)
+    mlp(x)
+    print("jit done")
 
-model_name = "/home/menooker/models/Qwen2.5-1.5B"
+
 
 if __name__ == "__main__":
     launcher_config = TorchrunConfig(nproc_per_node=1)
     scenario_config = InferenceConfig(latency=True)
     scenario_config.input_shapes['sequence_length']=128
+    scenario_config.input_shapes['batch_size'] = 1
     backend_config = PyTorchConfig(model=model_name, device="cuda", device_ids="0",  task='text-generation', torch_dtype="float16")
     name_postfix = "_mlp_optimized" if cutile_enabled else ""
     benchmark_config = BenchmarkConfig(
