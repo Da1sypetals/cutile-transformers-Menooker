@@ -51,7 +51,7 @@ def launch_matmul_silu_mul(a: torch.Tensor, b1: torch.Tensor, b2: torch.Tensor, 
     stream = torch.cuda.current_stream()
     M, N, K = a.shape[0], c.shape[1], a.shape[1]
     
-    tile_m, tile_n, tile_k = 64, 64, 64
+    tile_m, tile_n, tile_k = 64, 128, 64
     grid = (ceil(M/tile_m) * ceil(N/tile_n), 1, 1)
     assert b1.shape == (N, K)
     assert b2.shape == (N, K)
@@ -145,7 +145,7 @@ def test_matmul():
     import time
     import torch
     # Create input data
-    tile_m, tile_n, tile_k = 64, 64, 64
+    tile_m, tile_n, tile_k = 64, 128, 64
     M, N, K = 128, 8960, 1536
     grid = (ceil(M/tile_m) * ceil(N/tile_n), 1, 1)
     print("Grid size:", grid)

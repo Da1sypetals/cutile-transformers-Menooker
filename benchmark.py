@@ -3,11 +3,16 @@ from optimum_benchmark.logging_utils import setup_logging
 import torch
 import transformers.models.qwen2.modeling_qwen2 as qwen2_mod
 from cutile.modules.Qwen2MLP import MyQwen2MLP
+import argparse
 
+parser = argparse.ArgumentParser()
+parser.add_argument('--enable-cutile', action='store_true', help='Enable Cutile optimizations')
+parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-1.5B", help="Model name or path")
+args = parser.parse_args()
 
-model_name = "Qwen/Qwen2.5-1.5B"
+model_name = args.model #"Qwen/Qwen2.5-1.5B"
 setup_logging(level="INFO")
-cutile_enabled = True
+cutile_enabled = args.enable_cutile
 
 if cutile_enabled:
     print("Cutile enabled, trigger jit compilation")
