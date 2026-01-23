@@ -51,9 +51,8 @@ def gemv_split_k_kernel(A, B, C, f32acc, COUNTS,
 
 f32acc = None
 counts = None
-def launch_gemv(a: torch.Tensor, b1: torch.Tensor, c: torch.Tensor):
+def launch_gemv(a: torch.Tensor, b1: torch.Tensor, c: torch.Tensor, tile_n=128, tile_k=128, split_k=16):
     stream = torch.cuda.current_stream()
-    split_k, tile_n, tile_k = 16, 64, 64
     M, N, K = a.shape[0], c.shape[1], a.shape[1]
     grid = (ceil(N/tile_n), split_k, 1)
     assert b1.shape == (N, K)
@@ -86,7 +85,6 @@ def matmul(a, b, c, TILE_M: ct.Constant[int], TILE_N: ct.Constant[int], TILE_K: 
     accumulator = ct.full((TILE_M, TILE_N), 0, dtype=ct.float32)
     padding_mode = ct.PaddingMode.ZERO
 
-    dtype = ct.bfloat16
     for k in range(num_tiles_k):
         a_tile = ct.load(a, index=(m_idx, k), shape=(TILE_M, TILE_K), padding_mode=padding_mode, latency=latencyAB)
         if transb:
@@ -104,53 +102,105 @@ def matmul(a, b, c, TILE_M: ct.Constant[int], TILE_N: ct.Constant[int], TILE_K: 
     # Store result
     ct.store(c, index=(m_idx, n_idx), tile=accumulator, latency=latencyC)
 
-def launch_matmul(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, transb=False, act=0, out_dtype=torch.bfloat16):
+def launch_matmul(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, transb=False, act=0, tile_m=64, tile_n=64, tile_k=64, latencyAB=2, latencyC=2):
     stream = torch.cuda.current_stream()
-    tile_m, tile_n, tile_k = 64, 64, 64
     M, N, K = a.shape[0], c.shape[1], a.shape[1]
     grid = (ceil(M/tile_m) * ceil(N/tile_n), 1, 1)
     
     ct.launch(stream,
             grid,  # 1D grid of processors
             matmul,
-            (a, b, c, tile_m, tile_n, tile_k, transb, act))
+            (a, b, c, tile_m, tile_n, tile_k, transb, act, latencyAB, latencyC))
+    
+@ct.kernel(occupancy=ct.ByTarget(sm_120=2))
+def matmul_split_k_kernel(A, B, C, LOCKS, COUNTS,
+                          tm: ConstInt, tn: ConstInt, tk: ConstInt,
+                          SPLIT_K: ConstInt):
+    GROUP_SIZE_M = 8
+    M = A.shape[0]
+    N = C.shape[1]
+    pid = ct.bid(0)
+    num_tiles_n = ct.cdiv(N, tn)
+    bidx, bidy = pid // num_tiles_n, pid % num_tiles_n
+    bidz = ct.bid(1)
+
+    num_tiles = ct.num_tiles(A, axis=1, shape=(tm, tk))
+    sum = ct.full((tm, tn), 0, dtype=ct.float32)
+    zero_pad = ct.PaddingMode.ZERO
+
+    # Convert fp32 to tf32 to use tensorcore
+    dtype = ct.tfloat32 if A.dtype == ct.float32 else A.dtype
+
+    num_tiles_k = ct.num_tiles(A, axis=1, shape=(tm, tk))
+    split_size = ct.cdiv(num_tiles_k, SPLIT_K)
+    for k in range(bidz * split_size, bidz * split_size + split_size, 1):
+        a = ct.load(A, index=(bidx, k), shape=(tm, tk),
+                    padding_mode=zero_pad).astype(dtype)
+        b = ct.load(B, index=(bidy, k), shape=(tn, tk),
+                    padding_mode=zero_pad).astype(dtype)
+        sum = ct.mma(a, b.transpose(), sum)
+
+    sum = ct.astype(sum, C.dtype)
+    lock_offset = ct.bid(0)
+    count_offset = lock_offset
+    while ct.atomic_cas(LOCKS, lock_offset, 0, 1, memory_order=ct.MemoryOrder.ACQUIRE) == 1:
+        pass
+    count = ct.gather(COUNTS, count_offset)
+    if count == 0:
+        ct.store(C, index=(bidx, bidy), tile=sum)
+    else:
+        curr = ct.load(C, index=(bidx, bidy), shape=(tm, tn))
+        ct.store(C, index=(bidx, bidy), tile=(curr + sum))
+    ct.scatter(COUNTS, count_offset, (count + 1) % SPLIT_K)
+    ct.atomic_xchg(LOCKS, lock_offset, 0, memory_order=ct.MemoryOrder.RELEASE)
+
+
+locks = None
+def launch_gemm_split_k(a: torch.Tensor, b1: torch.Tensor, c: torch.Tensor):
+    stream = torch.cuda.current_stream()
+    split_k, tile_m, tile_n, tile_k = 4, 64, 64, 64
+    M, N, K = a.shape[0], c.shape[1], a.shape[1]
+    grid = (ceil(N/tile_n)*ceil(M/tile_m), split_k, 1)
+    assert b1.shape == (N, K)
+
+    global locks, counts
+    if locks is None or locks.numel() < grid[0]:
+        locks = torch.zeros((grid[0],), device='cuda', dtype=torch.int32)
+    if counts is None or counts.shape[0] < grid[0]:
+        counts = torch.zeros((grid[0],), device='cuda', dtype=torch.int32)
+    args = (a, b1, c, locks, counts, tile_m, tile_n, tile_k, split_k)
+    ct.launch(stream,
+            grid,
+            matmul_split_k_kernel,
+            args)
+
+
 
 # qwen2
 #launch_matmul torch.Size([1, 8960]) torch.Size([1536, 8960])
 
-def bench_matmul(a, b, c, M, N, K, transb, tile_m, tile_n, tile_k, latencyAB, latencyC, iter=50):
+def bench_matmul(a, b, c, launch_func, iter=50, **kwargs):
     import time
-    stream = torch.cuda.current_stream()
-    grid = (ceil(M/tile_m) * ceil(N/tile_n), 1, 1)
-    # warm up
-    ct.launch(stream,
-            grid,  # 1D grid of processors
-            matmul,
-            (a, b, c, tile_m, tile_n, tile_k, transb, 0, latencyAB, latencyC))
+    launch_func(a, b, c, **kwargs)
     torch.cuda.synchronize()
-    args = (a, b, c, tile_m, tile_n, tile_k, transb, 0, latencyAB, latencyC)
     start = time.time()
     for _ in range(iter):
-        ct.launch(stream,
-                grid,  # 1D grid of processors
-                matmul,
-                args)
+        launch_func(a, b, c, **kwargs)
     torch.cuda.synchronize()
     total = (time.time() - start)/iter
     return total * 1000  # ms
 
-def tune_matmul(a, b, c, M, N, K, transb):
-    cfgs = [(m, n, k, latencyAB, latencyC) for m in [32,64,128] for n in [32,64,128] for k in [64,128] for latencyAB in [1,2,3,4] for latencyC in [1,2,3,4]]
+def tune_matmul(a, b, c, cfgs, launch_func, **kwargs):
     best_time = float('inf')
     best_cfg = None
-    for (tile_m, tile_n, tile_k, latencyAB, latencyC) in cfgs:
-        total = bench_matmul(a, b, c, M, N, K, transb, tile_m, tile_n, tile_k, latencyAB, latencyC)
-        print(f"matmul tune: tile_m={tile_m}, tile_n={tile_n}, tile_k={tile_k}, latencyAB={latencyAB}, latencyC={latencyC}, time={total:.4f} ms")
+    for cfg in cfgs:
+        total = bench_matmul(a, b, c, launch_func, iter=50, **(kwargs | cfg))
+        print(f"matmul tune: {cfg}, time={total:.4f} ms")
         if total < best_time:
             best_time = total
-            best_cfg = (tile_m, tile_n, tile_k, latencyAB, latencyC)
+            best_cfg = cfg
         time.sleep(0.5)
-    print(f"Best matmul config: tile_m={best_cfg[0]}, tile_n={best_cfg[1]}, tile_k={best_cfg[2]}, latencyAB={best_cfg[3]}, latencyC={best_cfg[4]}, time={best_time:.4f} ms")
+    print(f"Best matmul config: {best_cfg}, time={best_time:.4f} ms")
 
 def test():
     import time
@@ -168,15 +218,7 @@ def test():
     # Launch kernel
 
     #benchmark this
-
-    stream = torch.cuda.current_stream()
-    args = (a, b, c, tile_m, tile_n, tile_k, False, 0, latencyAB, latencyC)
-    ct.launch(stream,
-            grid,  # 1D grid of processors
-            matmul,
-            args)
-    torch.cuda.synchronize()
-    total = bench_matmul(a, b, c, M, N, K, False, tile_m, tile_n, tile_k, latencyAB, latencyC)
+    total = bench_matmul(a, b, c, launch_matmul, iter=50, tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, latencyAB=latencyAB, latencyC=latencyC, act=0, transb=False)
     print(f"Kernel execution time: {total:.4f} ms")
 
     expected = torch.matmul(a, b)
@@ -185,22 +227,25 @@ def test():
     for _ in range(10):
         expected = torch.matmul(a, b)
     torch.cuda.synchronize()
-    end = time.time()
     total = (time.time() - start)/10
     print(f"PyTorch matmul execution time: {total*1000:.4f} ms")
     torch.testing.assert_close(c, expected)
 
 
-    tile_m, tile_n, tile_k, latencyAB, latencyC  = 32, 64, 128, 1, 1
+    tile_m, tile_n, tile_k, latencyAB, latencyC  = 64, 32, 128, 2, 2
     b = torch.rand((N, K), device='cuda', dtype=torch.float16)  # transposed b
-    ct.launch(stream,
-            grid,  # 1D grid of processors
-            matmul,
-            (a, b, c, tile_m, tile_n, tile_k, True, 0, latencyAB, latencyC))
-    torch.cuda.synchronize()
-    total = bench_matmul(a, b, c, M, N, K, True, tile_m, tile_n, tile_k, latencyAB, latencyC)
+    total = bench_matmul(a, b, c, launch_matmul, iter=50, tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, latencyAB=latencyAB, latencyC=latencyC, act=0, transb=True)
     print(f"Kernel execution time with transposed B: {total:.4f} ms")
 
+    c2 = torch.zeros((M, N), device='cuda', dtype=torch.float32)
+    launch_gemm_split_k(a, b, c2)
+    torch.cuda.synchronize()
+    start = time.time()
+    for _ in range(10):
+        launch_gemm_split_k(a, b, c2)
+    torch.cuda.synchronize()
+    total = (time.time() - start)/10
+    print(f"splitk execution time with transposed B: {total*1000:.4f} ms")
 
     expected = torch.matmul(a, b.T)
     torch.cuda.synchronize()
@@ -212,6 +257,7 @@ def test():
     total = (time.time() - start)/10
     print(f"Pytorch execution time with transposed B: {total*1000:.4f} ms")
     torch.testing.assert_close(c, expected)
+    # torch.testing.assert_close(c2, expected)
 
     print("✓ matmul_example passed!")
 
@@ -220,7 +266,7 @@ def test_gemv():
     import time
     import torch
     # Create input data
-    tile_m, tile_n, tile_k = 1, 64, 64
+    tile_m, tile_n, tile_k = 1, 128, 128
     split_k = 16
     M, N, K = 1, 1536, 8960
     grid = (ceil(N/tile_n), split_k, 1)
@@ -236,23 +282,9 @@ def test_gemv():
     # Launch kernel
 
     #benchmark this
+    total = bench_matmul(a, b, c, launch_gemv, iter=50, tile_n=tile_n, tile_k=tile_k, split_k=split_k)
+    print(f"Kernel execution time: {total:.4f} ms")
 
-    stream = torch.cuda.current_stream()
-    args = (a, b, c, f32acc, counts, tile_n, tile_k, split_k)
-    ct.launch(stream,
-            grid,  # 1D grid of processors
-            gemv_split_k_kernel,
-            args)
-    torch.cuda.synchronize()
-    start = time.time()
-    for _ in range(10):
-        ct.launch(stream,
-                grid,  # 1D grid of processors
-                gemv_split_k_kernel,
-                args)
-    torch.cuda.synchronize()
-    total = (time.time() - start)/10
-    print(f"Kernel execution time: {total*1000:.4f} ms")
 
     expected = torch.matmul(a, b.T)
     torch.cuda.synchronize()
@@ -273,7 +305,18 @@ if __name__ == "__main__":
     #             torch.rand((8960, 1536), device='cuda', dtype=torch.float16),
     #             torch.zeros((128, 1536), device='cuda', dtype=torch.float16),
     #             128, 1536, 8960, False)
+
+    # tune matmul a @ b.T
+    # cfgs = [{'tile_m': m, 'tile_n': n, 'tile_k': k, 'latencyAB': latencyAB, 'latencyC': latencyC} for m in [32,64,128] for n in [32,64,128] for k in [64,128] for latencyAB in [1,2] for latencyC in [1,2]]
     # tune_matmul(torch.rand((128, 8960), device='cuda', dtype=torch.float16),
     #             torch.rand((1536, 8960), device='cuda', dtype=torch.float16),
-    #             torch.zeros((128, 1536), device='cuda', dtype=torch.float16),
-    #             128, 1536, 8960, True)
+    #             torch.zeros((128, 1536), device='cuda', dtype=torch.float16), 
+    #             cfgs, launch_matmul,
+    #             act=0, transb=False)
+
+    # tune gemv a @ b.T
+    # cfgs = [{'tile_n': n, 'tile_k': k, 'split_k': splitk}  for n in [32,64,128] for k in [32,64,128] for splitk in [4,8,16]]
+    # tune_matmul(torch.rand((1, 8960), device='cuda', dtype=torch.float16),
+    #             torch.rand((1536, 8960), device='cuda', dtype=torch.float16),
+    #             torch.zeros((1, 1536), device='cuda', dtype=torch.float16), 
+    #             cfgs, launch_gemv)
