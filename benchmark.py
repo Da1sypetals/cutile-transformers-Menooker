@@ -17,6 +17,9 @@ cutile_enabled = args.enable_cutile
 if cutile_enabled:
     print("Cutile enabled, trigger jit compilation")
     qwen2_mod.Qwen2MLP = MyQwen2MLP
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+    from cutile.ops.attention import fmha
+    ALL_ATTENTION_FUNCTIONS["sdpa"] = fmha
     from transformers import AutoConfig
     config = AutoConfig.from_pretrained(model_name)
     hidden_size = config.hidden_size  # 1536
@@ -39,7 +42,7 @@ if __name__ == "__main__":
     scenario_config.input_shapes['sequence_length']=128
     scenario_config.input_shapes['batch_size'] = 1
     backend_config = PyTorchConfig(model=model_name, device="cuda", device_ids="0",  task='text-generation', torch_dtype="float16")
-    name_postfix = "_mlp_optimized" if cutile_enabled else ""
+    name_postfix = "_mlp_mha_optimized" if cutile_enabled else ""
     benchmark_config = BenchmarkConfig(
         name=f"qwen2.5-1.5B_inference{name_postfix}",
         scenario=scenario_config,
