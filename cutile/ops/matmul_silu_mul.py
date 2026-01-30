@@ -47,8 +47,7 @@ def matmul_silu_mul(a, b1, b2, c, TILE_M: ct.Constant[int], TILE_N: ct.Constant[
     # Store result
     ct.store(c, index=(m_idx, n_idx), tile=result)
 
-def launch_matmul_silu_mul(a: torch.Tensor, b1: torch.Tensor, b2: torch.Tensor, c: torch.Tensor, approx: bool = True):
-    stream = torch.cuda.current_stream()
+def launch_matmul_silu_mul(stream: torch.cuda.Stream, a: torch.Tensor, b1: torch.Tensor, b2: torch.Tensor, c: torch.Tensor, approx: bool = True):
     M, N, K = a.shape[0], c.shape[1], a.shape[1]
     
     tile_m, tile_n, tile_k = 64, 128, 64
@@ -118,10 +117,9 @@ def gemv_silu_mul_split_k_kernel(A, B1, B2, C, f32acc, COUNTS,
 
 _gemv_f32acc = None
 _gemv_counts = None
-def launch_gemv_silu_mul(a: torch.Tensor, b1: torch.Tensor, b2: torch.Tensor, c: torch.Tensor, approx: bool = True):
+def launch_gemv_silu_mul(stream: torch.cuda.Stream, a: torch.Tensor, b1: torch.Tensor, b2: torch.Tensor, c: torch.Tensor, approx: bool = True):
     global _gemv_f32acc, _gemv_counts
     
-    stream = torch.cuda.current_stream()
     split_k, tile_n, tile_k = 8, 32, 64
     M, N, K = a.shape[0], c.shape[1], a.shape[1]
     grid = (ceil(N/tile_n), split_k, 1)
@@ -222,11 +220,11 @@ def test_gemv_split_k():
     #         grid,
     #         gemv_silu_mul_split_k_kernel,
     #         args)
-    launch_gemv_silu_mul(a, b1, b2, c, False)
+    launch_gemv_silu_mul(stream, a, b1, b2, c, False)
     torch.cuda.synchronize()
     start = time.time()
     for _ in range(10):
-        launch_gemv_silu_mul(a, b1, b2, c, False)
+        launch_gemv_silu_mul(stream, a, b1, b2, c, False)
     torch.cuda.synchronize()
     total = (time.time() - start)/10
     print(f"gemv_silu_mul_split_k kernel time for 10 runs: {total*1000:.4f} ms")

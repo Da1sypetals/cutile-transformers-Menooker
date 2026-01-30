@@ -17,6 +17,7 @@ def fmha(
     scaling: Optional[float] = None,
     is_causal: Optional[bool] = None,
     has_backward: Optional[bool] = None,
+    stream: Optional[torch.cuda.Stream] = None,
     **kwargs,
 ) -> torch.Tensor:
     """
@@ -33,7 +34,10 @@ def fmha(
     is_causal = True if is_causal is None else is_causal
     has_backward = False if has_backward is None else has_backward
     # Call fmha_interface with the given arguments
+    if stream is None:
+        stream = torch.cuda.current_stream()
     o = fmha_prefill(
+        stream,
         q,
         k,
         v,

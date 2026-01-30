@@ -2,13 +2,12 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import transformers.models.qwen2.modeling_qwen2 as qwen2_mod
 from cutile.ops.matmul import launch_matmul
-from cutile.modules.Qwen2MLP import MyQwen2MLP
-from cutile.ops.attention import fmha
+from cutile.modules.Qwen2MLP import MyQwen2Model
 
 
-qwen2_mod.Qwen2MLP = MyQwen2MLP
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-ALL_ATTENTION_FUNCTIONS["sdpa"] = fmha
+qwen2_mod.Qwen2Model = MyQwen2Model
+# from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+# ALL_ATTENTION_FUNCTIONS["sdpa"] = fmha
 
 model_name = "Qwen/Qwen2.5-1.5B"
 

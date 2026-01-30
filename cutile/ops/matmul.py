@@ -51,8 +51,7 @@ def gemv_split_k_kernel(A, B, C, f32acc, COUNTS,
 
 f32acc = None
 counts = None
-def launch_gemv(a: torch.Tensor, b1: torch.Tensor, c: torch.Tensor, tile_n=128, tile_k=128, split_k=16):
-    stream = torch.cuda.current_stream()
+def launch_gemv(stream: torch.cuda.Stream, a: torch.Tensor, b1: torch.Tensor, c: torch.Tensor, tile_n=128, tile_k=128, split_k=16):
     M, N, K = a.shape[0], c.shape[1], a.shape[1]
     grid = (ceil(N/tile_n), split_k, 1)
     assert b1.shape == (N, K)
@@ -102,8 +101,7 @@ def matmul(a, b, c, TILE_M: ct.Constant[int], TILE_N: ct.Constant[int], TILE_K: 
     # Store result
     ct.store(c, index=(m_idx, n_idx), tile=accumulator, latency=latencyC)
 
-def launch_matmul(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, transb=False, act=0, tile_m=64, tile_n=64, tile_k=64, latencyAB=2, latencyC=2):
-    stream = torch.cuda.current_stream()
+def launch_matmul(stream: torch.cuda.Stream, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, transb=False, act=0, tile_m=64, tile_n=64, tile_k=64, latencyAB=2, latencyC=2):
     M, N, K = a.shape[0], c.shape[1], a.shape[1]
     grid = (ceil(M/tile_m) * ceil(N/tile_n), 1, 1)
     
@@ -156,8 +154,7 @@ def matmul_split_k_kernel(A, B, C, LOCKS, COUNTS,
 
 
 locks = None
-def launch_gemm_split_k(a: torch.Tensor, b1: torch.Tensor, c: torch.Tensor):
-    stream = torch.cuda.current_stream()
+def launch_gemm_split_k(stream: torch.cuda.Stream, a: torch.Tensor, b1: torch.Tensor, c: torch.Tensor):
     split_k, tile_m, tile_n, tile_k = 4, 64, 64, 64
     M, N, K = a.shape[0], c.shape[1], a.shape[1]
     grid = (ceil(N/tile_n)*ceil(M/tile_m), split_k, 1)
@@ -180,12 +177,13 @@ def launch_gemm_split_k(a: torch.Tensor, b1: torch.Tensor, c: torch.Tensor):
 #launch_matmul torch.Size([1, 8960]) torch.Size([1536, 8960])
 
 def bench_matmul(a, b, c, launch_func, iter=50, **kwargs):
+    stream = torch.cuda.current_stream()
     import time
-    launch_func(a, b, c, **kwargs)
+    launch_func(stream, a, b, c, **kwargs)
     torch.cuda.synchronize()
     start = time.time()
     for _ in range(iter):
-        launch_func(a, b, c, **kwargs)
+        launch_func(stream, a, b, c, **kwargs)
     torch.cuda.synchronize()
     total = (time.time() - start)/iter
     return total * 1000  # ms
@@ -237,12 +235,13 @@ def test():
     total = bench_matmul(a, b, c, launch_matmul, iter=50, tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, latencyAB=latencyAB, latencyC=latencyC, act=0, transb=True)
     print(f"Kernel execution time with transposed B: {total:.4f} ms")
 
+    stream = torch.cuda.current_stream()
     c2 = torch.zeros((M, N), device='cuda', dtype=torch.float32)
-    launch_gemm_split_k(a, b, c2)
+    launch_gemm_split_k(stream, a, b, c2)
     torch.cuda.synchronize()
     start = time.time()
     for _ in range(10):
-        launch_gemm_split_k(a, b, c2)
+        launch_gemm_split_k(stream, a, b, c2)
     torch.cuda.synchronize()
     total = (time.time() - start)/10
     print(f"splitk execution time with transposed B: {total*1000:.4f} ms")

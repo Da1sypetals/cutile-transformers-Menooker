@@ -227,7 +227,7 @@ def cutile_autotune_fmha(
     return o
 
 _max_tile_n = max(cfg.TILE_N for cfg in _fmha_autotune_configs())
-def fmha_prefill(q: torch.Tensor, k, v, scaling, is_causal=True):
+def fmha_prefill(stream, q: torch.Tensor, k, v, scaling, is_causal=True, TILE_M=64, TILE_N=64):
     batch_size, num_heads, q_len, hidden_size = q.shape
     _, num_head_kv, k_len, _ = k.shape
 
@@ -245,20 +245,26 @@ def fmha_prefill(q: torch.Tensor, k, v, scaling, is_causal=True):
     input_pos = 0  # prefill, causal
 
     EVEN_K = (k_len % _max_tile_n) == 0
-    return cutile_autotune_fmha(
-        torch.cuda.current_stream(),
-        q2,
-        k,
-        v,
-        o,
-        scaling,
-        input_pos,
-        hidden_size,
-        num_heads,
-        query_group_size,
-        is_causal,
-        EVEN_K,
-    )
+    grid = (math.ceil(q_len / TILE_M), batch_size * num_heads, 1)
+    ct.launch(stream,
+            grid,  # 1D grid of processors
+            fmha_kernel,
+            (
+                q2,
+                k,
+                v,
+                o,
+                scaling,
+                input_pos,
+                hidden_size,
+                num_heads,
+                TILE_M,
+                TILE_N,
+                query_group_size,
+                is_causal,
+                EVEN_K,
+            ))
+    return o
 
 # specialized fmha_prefill for fast inference of qwen2.5-1.5b
 def fmha_prefill_fast(stream, q: torch.Tensor, k, v, scaling, is_causal=True, TILE_M=64, TILE_N=64):
@@ -323,11 +329,11 @@ if __name__ == "__main__":
     # ct_experimental._autotuner.logger.setLevel(logging.DEBUG)
 
     stream = torch.cuda.current_stream()
-    o = fmha_prefill_fast(stream, q, k, v, scaling=0.08838834764831845, is_causal=True)
+    o = fmha_prefill(stream, q, k, v, scaling=0.08838834764831845, is_causal=True)
     torch.cuda.synchronize()
     start_time = time.time()
     for _ in range(10):
-        o = fmha_prefill_fast(stream, q, k, v, scaling=0.08838834764831845, is_causal=True)
+        o = fmha_prefill(stream, q, k, v, scaling=0.08838834764831845, is_causal=True)
     torch.cuda.synchronize()
     end_time = time.time()
     print(f"Time taken for fmha_prefill: {(end_time - start_time) * 1000/10} ms")

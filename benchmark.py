@@ -2,7 +2,7 @@ from optimum_benchmark import Benchmark, BenchmarkConfig, TorchrunConfig, Infere
 from optimum_benchmark.logging_utils import setup_logging
 import torch
 import transformers.models.qwen2.modeling_qwen2 as qwen2_mod
-from cutile.modules.Qwen2MLP import MyQwen2MLP
+from cutile.modules.Qwen2MLP import MyQwen2Model
 import argparse
 
 parser = argparse.ArgumentParser()
@@ -16,22 +16,19 @@ cutile_enabled = args.enable_cutile
 
 if cutile_enabled:
     print("Cutile enabled, trigger jit compilation")
-    qwen2_mod.Qwen2MLP = MyQwen2MLP
-    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-    from cutile.ops.attention import fmha
-    ALL_ATTENTION_FUNCTIONS["sdpa"] = fmha
+    qwen2_mod.Qwen2Model = MyQwen2Model
     from transformers import AutoConfig
     config = AutoConfig.from_pretrained(model_name)
     hidden_size = config.hidden_size  # 1536
     intermediate_size = config.intermediate_size  # 8960
-    mlp = MyQwen2MLP(config).to('cuda')
-    batch_size = 1
-    seq_len = 128
+    # mlp = MyQwen2Model(config).to('cuda')
+    # batch_size = 1
+    # seq_len = 128
     
-    x = torch.randn((batch_size, seq_len, hidden_size), device='cuda', dtype=torch.float16)
-    mlp(x)
-    x = torch.randn((batch_size, 1, hidden_size), device='cuda', dtype=torch.float16)
-    mlp(x)
+    # x = torch.randn((batch_size, seq_len, hidden_size), device='cuda', dtype=torch.float16)
+    # mlp(x)
+    # x = torch.randn((batch_size, 1, hidden_size), device='cuda', dtype=torch.float16)
+    # mlp(x)
     print("jit done")
 
 
