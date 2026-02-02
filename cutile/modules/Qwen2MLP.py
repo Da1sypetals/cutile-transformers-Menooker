@@ -53,6 +53,7 @@ def my_qwen2_mlp(
 
 def my_qwen2_self_attn(
     stream: torch.cuda.Stream,
+    out: torch.Tensor,
     self: Qwen2Attention,
     hidden_states: torch.Tensor,
     position_embeddings: tuple[torch.Tensor, torch.Tensor],
@@ -79,6 +80,8 @@ def my_qwen2_self_attn(
         )
 
     attn_output, attn_weights = fmha(
+        stream,
+        out,
         self,
         query_states,
         key_states,
@@ -87,7 +90,6 @@ def my_qwen2_self_attn(
         dropout=0.0 if not self.training else self.attention_dropout,
         scaling=self.scaling,
         sliding_window=self.sliding_window,  # main diff with Llama
-        stream=stream,
         **kwargs,
     )
 
@@ -98,6 +100,7 @@ def my_qwen2_self_attn(
 
 def my_qwen2_decoder_layer(
     stream: torch.cuda.Stream,
+    out: torch.Tensor,
     self: Qwen2DecoderLayer,
     hidden_states: torch.Tensor,
     attention_mask: Optional[torch.Tensor] = None,
@@ -115,6 +118,7 @@ def my_qwen2_decoder_layer(
     # Self Attention
     hidden_states, _ = my_qwen2_self_attn(
         stream,
+        out,
         self.self_attn,
         hidden_states=hidden_states,
         attention_mask=attention_mask,
@@ -220,9 +224,12 @@ class MyQwen2Model(Qwen2PreTrainedModel):
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         stream = torch.cuda.current_stream()
+        hidden_states_shape = hidden_states.shape
+        out = torch.empty((hidden_states_shape[0], hidden_states_shape[1], self.config.num_attention_heads, hidden_states_shape[2] // self.config.num_attention_heads), device=hidden_states.device, dtype=hidden_states.dtype)
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             hidden_states = my_qwen2_decoder_layer(
                 stream,
+                out,
                 decoder_layer,
                 hidden_states,
                 attention_mask=causal_mask_mapping[decoder_layer.attention_type],

@@ -227,7 +227,7 @@ def cutile_autotune_fmha(
     return o
 
 _max_tile_n = max(cfg.TILE_N for cfg in _fmha_autotune_configs())
-def fmha_prefill(stream, q: torch.Tensor, k, v, scaling, is_causal=True, TILE_M=64, TILE_N=64):
+def fmha_prefill(stream, q: torch.Tensor, k, v, scaling, is_causal=True, TILE_M=64, TILE_N=64, out: torch.Tensor = None):
     batch_size, num_heads, q_len, hidden_size = q.shape
     _, num_head_kv, k_len, _ = k.shape
 
@@ -240,7 +240,7 @@ def fmha_prefill(stream, q: torch.Tensor, k, v, scaling, is_causal=True, TILE_M=
     # q = q.contiguous() if not q.is_contiguous() else q
     # k = k.contiguous() if not k.is_contiguous() else k
     # v = v.contiguous() if not v.is_contiguous() else v
-    o = torch.empty_like(q2)
+    o = out if out is not None else torch.empty_like(q2)
 
     input_pos = 0  # prefill, causal
 
@@ -329,11 +329,12 @@ if __name__ == "__main__":
     # ct_experimental._autotuner.logger.setLevel(logging.DEBUG)
 
     stream = torch.cuda.current_stream()
-    o = fmha_prefill(stream, q, k, v, scaling=0.08838834764831845, is_causal=True)
+    out = torch.empty_like(q2)
+    o = fmha_prefill(stream, q, k, v, scaling=0.08838834764831845, is_causal=True, out=out)
     torch.cuda.synchronize()
     start_time = time.time()
     for _ in range(10):
-        o = fmha_prefill(stream, q, k, v, scaling=0.08838834764831845, is_causal=True)
+        o = fmha_prefill(stream, q, k, v, scaling=0.08838834764831845, is_causal=True, out=out)
     torch.cuda.synchronize()
     end_time = time.time()
     print(f"Time taken for fmha_prefill: {(end_time - start_time) * 1000/10} ms")

@@ -8,6 +8,8 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 old = ALL_ATTENTION_FUNCTIONS["sdpa"]
 
 def fmha(
+    stream: torch.cuda.Stream,
+    out: torch.Tensor,
     module: torch.nn.Module,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -17,7 +19,6 @@ def fmha(
     scaling: Optional[float] = None,
     is_causal: Optional[bool] = None,
     has_backward: Optional[bool] = None,
-    stream: Optional[torch.cuda.Stream] = None,
     **kwargs,
 ) -> torch.Tensor:
     """
@@ -43,6 +44,7 @@ def fmha(
         v,
         is_causal=is_causal,
         scaling=scaling,
+        out=out,
     )
     # return o.transpose(1, 2).contiguous(), None
     return o, None
