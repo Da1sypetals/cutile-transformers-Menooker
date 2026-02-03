@@ -2,6 +2,8 @@
 import cuda.tile as ct
 from math import ceil
 import torch
+import cuda.tile_experimental as ct_experimental
+from types import SimpleNamespace
 
 def silu_and_mul(x, y, approx: bool):
     '''
@@ -15,7 +17,7 @@ def silu_and_mul(x, y, approx: bool):
     silu = ct.mul(x, sigmoid_x, flush_to_zero=True)
     return ct.mul(silu, y, flush_to_zero=True)
 
-@ct.kernel(occupancy=ct.ByTarget(sm_120=8))
+@ct.kernel(occupancy=ct.ByTarget(sm_120=2))
 def matmul_silu_mul(a, b1, b2, c, TILE_M: ct.Constant[int], TILE_N: ct.Constant[int], TILE_K: ct.Constant[int], approx: ct.Constant[bool]):
     '''
     perform C = SiLU(A @ B1^T) * (A @ B2^T)
@@ -50,7 +52,7 @@ def matmul_silu_mul(a, b1, b2, c, TILE_M: ct.Constant[int], TILE_N: ct.Constant[
 def launch_matmul_silu_mul(stream: torch.cuda.Stream, a: torch.Tensor, b1: torch.Tensor, b2: torch.Tensor, c: torch.Tensor, approx: bool = True):
     M, N, K = a.shape[0], c.shape[1], a.shape[1]
     
-    tile_m, tile_n, tile_k = 64, 128, 64
+    tile_m, tile_n, tile_k = 64, 64, 128
     grid = (ceil(M/tile_m) * ceil(N/tile_n), 1, 1)
     assert b1.shape == (N, K)
     assert b2.shape == (N, K)
@@ -58,6 +60,21 @@ def launch_matmul_silu_mul(stream: torch.cuda.Stream, a: torch.Tensor, b1: torch
             grid,  # 1D grid of processors
             matmul_silu_mul,
             (a, b1, b2, c, tile_m, tile_n, tile_k, approx))
+def launch_matmul_silu_mul_auto_tune(stream: torch.cuda.Stream, a: torch.Tensor, b1: torch.Tensor, b2: torch.Tensor, c: torch.Tensor, approx: bool = True):
+    M, N, K = a.shape[0], c.shape[1], a.shape[1]
+    assert b1.shape == (N, K)
+    assert b2.shape == (N, K)
+    ct_experimental.autotune_launch(
+        stream,
+        grid_fn=lambda cfg: (ceil(M/cfg.tile_m) * ceil(N/cfg.tile_n), 1, 1),
+        kernel=matmul_silu_mul,
+        args_fn=lambda cfg: (a, b1, b2, c, cfg.tile_m, cfg.tile_n, cfg.tile_k, approx),
+        hints_fn=lambda cfg: {
+            "occupancy": cfg.occupancy,
+        },
+        search_space=[SimpleNamespace(tile_m=TM, tile_n=TN, tile_k=TK, occupancy=occupancy)
+                for TM in [32, 64] for TN in [32, 64, 128] for TK in [32, 64, 128] for occupancy in [1, 2, 4, 8]],
+    )
 
 ConstInt = ct.Constant[int]
 @ct.kernel(occupancy=ct.ByTarget(sm_120=8))
@@ -143,10 +160,7 @@ def test_matmul():
     import time
     import torch
     # Create input data
-    tile_m, tile_n, tile_k = 64, 128, 64
     M, N, K = 128, 8960, 1536
-    grid = (ceil(M/tile_m) * ceil(N/tile_n), 1, 1)
-    print("Grid size:", grid)
 
     a = torch.rand((M, K), device='cuda', dtype=torch.float16)/100
     b1 = torch.rand((N, K), device='cuda', dtype=torch.float16)/100
@@ -158,20 +172,16 @@ def test_matmul():
     #benchmark this
 
     stream = torch.cuda.current_stream()
-    args = (a, b1, b2, c, tile_m, tile_n, tile_k, False)
-    ct.launch(stream,
-            grid,  # 1D grid of processors
-            matmul_silu_mul,
-            args)
+    # show debug DEBUG level logs
+    # import logging
+    # logging.basicConfig(level=logging.DEBUG)
+    
+    # launch_matmul_silu_mul_auto_tune(stream, a, b1, b2, c, True)
+    launch_matmul_silu_mul(stream, a, b1, b2, c, True)
     torch.cuda.synchronize()
     start = time.time()
     for _ in range(10):
-        c = torch.empty((M, N), device='cuda', dtype=torch.float16)
-        args = (a, b1, b2, c, tile_m, tile_n, tile_k, False)
-        ct.launch(stream,
-                grid,  # 1D grid of processors
-                matmul_silu_mul,
-                args)
+        launch_matmul_silu_mul(stream, a, b1, b2, c, True)
     torch.cuda.synchronize()
     total = (time.time() - start)/10
     print(f"matmul_silu_mul kernel time for 10 runs: {total*1000:.4f} ms")

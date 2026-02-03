@@ -29,26 +29,30 @@ def my_qwen2_mlp(
     stream: torch.cuda.Stream,
     self: Qwen2MLP,
     x: torch.Tensor,
+    intermediate_buffer: torch.Tensor,
+    output_buffer: torch.Tensor
 ) -> torch.Tensor:
     batch_size = x.size(0)
     xv = x.view(-1, x.size(-1))
     M = xv.size(0)
-    v0 = torch.empty((M, self.intermediate_size), device=x.device, dtype=torch.float16)
+    # v0 = torch.empty((M, self.intermediate_size), device=x.device, dtype=torch.float16)
     if M == 1:
-        # print(xv.shape)
         launch_gemv_silu_mul(
-            stream, xv, self.gate_proj.weight, self.up_proj.weight, v0, approx=True
+            stream, xv, self.gate_proj.weight, self.up_proj.weight, intermediate_buffer, approx=True
         )
     else:
+        print(xv.shape, self.gate_proj.weight.shape, self.up_proj.weight.shape)
         launch_matmul_silu_mul(
-            stream, xv, self.gate_proj.weight, self.up_proj.weight, v0, approx=True
+            stream, xv, self.gate_proj.weight, self.up_proj.weight, intermediate_buffer, approx=True
         )
-    down_proj = torch.empty((M, self.hidden_size), device=x.device, dtype=torch.float16)
+        # a = torch.matmul(xv, self.gate_proj.weight.T)
+        # v0 = torch.sigmoid(a) * a  * torch.matmul(xv, self.up_proj.weight.T)
     if M == 1:
-        launch_gemv(stream, v0, self.down_proj.weight, down_proj)
+        launch_gemv(stream, intermediate_buffer, self.down_proj.weight, output_buffer)
     else:
-        launch_matmul(stream, v0, self.down_proj.weight, down_proj, transb=True, act=0)
-    return down_proj.view(batch_size, -1, self.hidden_size)
+        # launch_matmul(stream, v0, self.down_proj.weight, down_proj, transb=True, act=0)
+        torch.matmul(intermediate_buffer, self.down_proj.weight.T, out=output_buffer)
+    return output_buffer.view(batch_size, -1, self.hidden_size)
 
 
 def my_qwen2_self_attn(
@@ -101,6 +105,8 @@ def my_qwen2_self_attn(
 def my_qwen2_decoder_layer(
     stream: torch.cuda.Stream,
     out: torch.Tensor,
+    mlp_intermediate_buffer: torch.Tensor,
+    mlp_output_buffer: torch.Tensor,
     self: Qwen2DecoderLayer,
     hidden_states: torch.Tensor,
     attention_mask: Optional[torch.Tensor] = None,
@@ -134,7 +140,7 @@ def my_qwen2_decoder_layer(
     # Fully Connected
     residual = hidden_states
     hidden_states = self.post_attention_layernorm(hidden_states)
-    hidden_states = my_qwen2_mlp(stream, self.mlp, hidden_states)
+    hidden_states = my_qwen2_mlp(stream, self.mlp, hidden_states, mlp_intermediate_buffer, mlp_output_buffer)
     hidden_states = residual + hidden_states
     return hidden_states
 
@@ -224,12 +230,17 @@ class MyQwen2Model(Qwen2PreTrainedModel):
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         stream = torch.cuda.current_stream()
-        hidden_states_shape = hidden_states.shape
-        out = torch.empty((hidden_states_shape[0], hidden_states_shape[1], self.config.num_attention_heads, hidden_states_shape[2] // self.config.num_attention_heads), device=hidden_states.device, dtype=hidden_states.dtype)
+        bs, seq_len, hidden_size = hidden_states.shape
+        attn_out = torch.empty((bs, seq_len, self.config.num_attention_heads, hidden_size // self.config.num_attention_heads), device=hidden_states.device, dtype=hidden_states.dtype)
+        mlp_intermediate_buffer = torch.empty((bs * seq_len, self.config.intermediate_size), device=hidden_states.device, dtype=hidden_states.dtype)
+        mlp_output_buffer = torch.empty((bs * seq_len, self.config.hidden_size), device=hidden_states.device, dtype=hidden_states.dtype)
+        
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             hidden_states = my_qwen2_decoder_layer(
                 stream,
-                out,
+                attn_out,
+                mlp_intermediate_buffer,
+                mlp_output_buffer,
                 decoder_layer,
                 hidden_states,
                 attention_mask=causal_mask_mapping[decoder_layer.attention_type],
