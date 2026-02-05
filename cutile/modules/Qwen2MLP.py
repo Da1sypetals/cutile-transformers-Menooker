@@ -21,7 +21,7 @@ from transformers.models.qwen2.modeling_qwen2 import (
 from transformers.modeling_outputs import BaseModelOutputWithPast, Cache
 from typing import Optional
 from cutile.ops.matmul_silu_mul import launch_matmul_silu_mul, launch_gemv_silu_mul
-from cutile.ops.matmul import launch_matmul, launch_gemv
+from cutile.ops.matmul import launch_matmul, launch_gemv, ACT_BIAS
 from cutile.ops.attention import fmha
 
 
@@ -29,23 +29,25 @@ def my_qwen2_mlp(
     stream: torch.cuda.Stream,
     self: Qwen2MLP,
     x: torch.Tensor,
+    residual: torch.Tensor,
     intermediate_buffer: torch.Tensor,
     output_buffer: torch.Tensor
 ) -> torch.Tensor:
     batch_size = x.size(0)
     xv = x.view(-1, x.size(-1))
     M = xv.size(0)
+    residual = residual.view(-1, self.hidden_size)
     # v0 = torch.empty((M, self.intermediate_size), device=x.device, dtype=torch.float16)
     if M == 1:
         launch_gemv_silu_mul(
             stream, xv, self.gate_proj.weight, self.up_proj.weight, intermediate_buffer, approx=True
         )
-        launch_gemv(stream, intermediate_buffer, self.down_proj.weight, output_buffer)
+        launch_gemv(stream, intermediate_buffer, self.down_proj.weight, output_buffer, bias=residual)
     else:
         launch_matmul_silu_mul(
             stream, xv, self.gate_proj.weight, self.up_proj.weight, intermediate_buffer, approx=True
         )
-        launch_matmul(stream, intermediate_buffer, self.down_proj.weight, output_buffer, transb=True, act=0)
+        launch_matmul(stream, intermediate_buffer, self.down_proj.weight, output_buffer, transb=True, act=ACT_BIAS, bias=residual)
         # a = torch.matmul(xv, self.gate_proj.weight.T)
         # v0 = torch.sigmoid(a) * a  * torch.matmul(xv, self.up_proj.weight.T)
         # torch.matmul(intermediate_buffer, self.down_proj.weight.T, out=output_buffer)
@@ -137,8 +139,8 @@ def my_qwen2_decoder_layer(
     # Fully Connected
     residual = hidden_states
     hidden_states = self.post_attention_layernorm(hidden_states)
-    hidden_states = my_qwen2_mlp(stream, self.mlp, hidden_states, mlp_intermediate_buffer, mlp_output_buffer)
-    hidden_states = residual + hidden_states
+    hidden_states = my_qwen2_mlp(stream, self.mlp, hidden_states, residual, mlp_intermediate_buffer, mlp_output_buffer)
+    # hidden_states = residual + hidden_states
     return hidden_states
 
 

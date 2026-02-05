@@ -7,13 +7,14 @@ import torch
 ACT_RELU = 1
 ACT_SILU = 2
 ACT_NONE = 0
+ACT_BIAS = 3
 
 ConstInt = ct.Constant[int]
 
 @ct.kernel(occupancy=ct.ByTarget(sm_120=2))
-def gemv_split_k_kernel(A, B, C, f32acc, COUNTS,
+def gemv_split_k_kernel(A, B, C, bias, f32acc, COUNTS,
                           tn: ConstInt, tk: ConstInt,
-                          SPLIT_K: ConstInt):
+                          SPLIT_K: ConstInt, act: ConstInt):
     GROUP_SIZE_M = 1
     M = 1
     N = B.shape[1]
@@ -45,13 +46,16 @@ def gemv_split_k_kernel(A, B, C, f32acc, COUNTS,
     new_count = ct.atomic_add(COUNTS, count_offset, 1)
     if (new_count + 1) % SPLIT_K == 0:
         result = ct.gather(f32acc, (0, C_offset))
+        if act == ACT_BIAS:
+            bias_tile = ct.gather(bias, (0, C_offset))
+            result = result + bias_tile.astype(f32acc.dtype)
         ct.scatter(C, (0, C_offset), result.astype(C.dtype))
         ct.scatter(f32acc, (0, C_offset), 0)
         ct.scatter(COUNTS, count_offset, 0)
 
 f32acc = None
 counts = None
-def launch_gemv(stream: torch.cuda.Stream, a: torch.Tensor, b1: torch.Tensor, c: torch.Tensor, tile_n=128, tile_k=128, split_k=16):
+def launch_gemv(stream: torch.cuda.Stream, a: torch.Tensor, b1: torch.Tensor, c: torch.Tensor, bias = 0, tile_n=128, tile_k=128, split_k=16):
     M, N, K = a.shape[0], c.shape[1], a.shape[1]
     grid = (ceil(N/tile_n), split_k, 1)
     assert b1.shape == (N, K)
@@ -62,25 +66,38 @@ def launch_gemv(stream: torch.cuda.Stream, a: torch.Tensor, b1: torch.Tensor, c:
         f32acc = torch.zeros((1, N), device='cuda', dtype=torch.float32)
     if counts is None or counts.shape[0] < grid[0]:
         counts = torch.zeros((grid[0],), device='cuda', dtype=torch.int32)
-    args = (a, b1, c, f32acc, counts, tile_n, tile_k, split_k)
+    args = (a, b1, c, bias, f32acc, counts, tile_n, tile_k, split_k, ACT_BIAS if isinstance(bias, torch.Tensor) else ACT_NONE)
     ct.launch(stream,
             grid,
             gemv_split_k_kernel,
             args)
 
+def swizzle_2d(M, N, TILE_SIZE_M, TILE_SIZE_N, GROUP_SIZE_M):
+    # Get the global IDs of the current CUDA block (CTA) in a 1D grid.
+    bid = ct.bid(0)
+    num_bid_m = ct.cdiv(M, TILE_SIZE_M)
+    num_bid_n = ct.cdiv(N, TILE_SIZE_N)
+    num_bid_in_group = GROUP_SIZE_M * num_bid_n
+    group_id = bid // num_bid_in_group
+    first_bid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_bid_m - first_bid_m, GROUP_SIZE_M)
+    bid_m = first_bid_m + (bid % group_size_m)
+    bid_n = (bid % num_bid_in_group) // group_size_m
+    return bid_m, bid_n
 
-
-@ct.kernel(occupancy=ct.ByTarget(sm_120=2))
-def matmul(a, b, c, TILE_M: ct.Constant[int], TILE_N: ct.Constant[int], TILE_K: ct.Constant[int], transb: ct.Constant[bool], act: ct.Constant[int], latencyAB: ct.Constant[int], latencyC: ct.Constant[int]):
-    # Get the 1D pid
-    pid = ct.bid(0)
+@ct.kernel(occupancy=ct.ByTarget(sm_120=4))
+def matmul(a, b, c, bias, TILE_M: ct.Constant[int], TILE_N: ct.Constant[int], TILE_K: ct.Constant[int], transb: ct.Constant[bool], act: ct.Constant[int], latencyAB: ct.Constant[int], latencyC: ct.Constant[int], swizzle=ct.Constant[bool]):
     M,K = a.shape[0], a.shape[1]
     N = b.shape[1] if not transb else b.shape[0]
-    num_tiles_m = ct.cdiv(M, TILE_M)
-    num_tiles_n = ct.cdiv(N, TILE_N)
     num_tiles_k = ct.cdiv(K, TILE_K)
-    m_idx = pid // num_tiles_n
-    n_idx = pid % num_tiles_n
+    if swizzle:
+        GROUP_SIZE_M = 8
+        m_idx, n_idx = swizzle_2d(M, N, TILE_M, TILE_N, GROUP_SIZE_M)
+    else:
+        # Get the 1D pid
+        pid = ct.bid(0)
+        m_idx = pid // ct.cdiv(N, TILE_N)
+        n_idx = pid % ct.cdiv(N, TILE_N)
     accumulator = ct.full((TILE_M, TILE_N), 0, dtype=ct.float32)
     padding_mode = ct.PaddingMode.ZERO
 
@@ -96,34 +113,38 @@ def matmul(a, b, c, TILE_M: ct.Constant[int], TILE_N: ct.Constant[int], TILE_K: 
         accumulator = ct.maximum(accumulator, 0)
     elif act == 2:
         accumulator = accumulator * ct.sigmoid(accumulator)
+    elif act == 3:
+        bias_tile = ct.load(bias, index=(m_idx, n_idx), shape=(TILE_M, TILE_N), padding_mode=padding_mode)
+        accumulator = accumulator + bias_tile
     # Load input tiles
     accumulator = accumulator.astype(c.dtype)
     # Store result
     ct.store(c, index=(m_idx, n_idx), tile=accumulator, latency=latencyC)
 
-def launch_matmul(stream: torch.cuda.Stream, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, transb=False, act=0, tile_m=64, tile_n=64, tile_k=64, latencyAB=2, latencyC=2):
+def launch_matmul(stream: torch.cuda.Stream, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, transb=False, bias=0, act=0, swizzle=False, tile_m=32, tile_n=32, tile_k=128, latencyAB=4, latencyC=1):
     M, N, K = a.shape[0], c.shape[1], a.shape[1]
-    grid = (ceil(M/tile_m) * ceil(N/tile_n), 1, 1)
+    grid = (ct.cdiv(M, tile_m) * ct.cdiv(N, tile_n), 1, 1)
     
     ct.launch(stream,
             grid,  # 1D grid of processors
             matmul,
-            (a, b, c, tile_m, tile_n, tile_k, transb, act, latencyAB, latencyC))
+            (a, b, c, bias, tile_m, tile_n, tile_k, transb, act, latencyAB, latencyC, swizzle))
 
-def launch_matmul_auto_tune(stream: torch.cuda.Stream, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, transb=False, act=0):
+def launch_matmul_auto_tune(stream: torch.cuda.Stream, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, bias: torch.Tensor, transb=False, act=0):
     M, N, K = a.shape[0], c.shape[1], a.shape[1]
     import cuda.tile_experimental as ct_experimental
     from types import SimpleNamespace
     ct_experimental.autotune_launch(
         stream,
-        grid_fn=lambda cfg: (ceil(M/cfg.tile_m) * ceil(N/cfg.tile_n), 1, 1),
+        grid_fn=lambda cfg: (ct.cdiv(M, cfg.tile_m) * ct.cdiv(N, cfg.tile_n), 1, 1),
         kernel=matmul,
-        args_fn=lambda cfg: (a, b, c, cfg.tile_m, cfg.tile_n, cfg.tile_k, transb, act, cfg.latencyAB, cfg.latencyC),
+        args_fn=lambda cfg: (a, b, c, bias, cfg.tile_m, cfg.tile_n, cfg.tile_k, transb, act, cfg.latencyAB, cfg.latencyC, cfg.swizzle),
         hints_fn=lambda cfg: {
             "occupancy": cfg.occupancy,
         },
-        search_space=[SimpleNamespace(tile_m=TM, tile_n=TN, tile_k=TK, occupancy=occupancy, latencyAB=latencyAB, latencyC=latencyC)
-                for TM in [32, 64] for TN in [32, 64, 128] for TK in [32, 64, 128] for occupancy in [1, 2, 4, 8] for latencyAB in [1, 2, 4] for latencyC in [1, 2, 4]],
+        search_space=[SimpleNamespace(tile_m=TM, tile_n=TN, tile_k=TK, occupancy=occupancy, latencyAB=latencyAB, latencyC=latencyC, swizzle=swizzle)
+                for TM in [32, 64] for TN in [32, 64, 128] for TK in [32, 64, 128] for occupancy in [1, 2, 4, 8] for latencyAB in [1, 2, 4]\
+                    for latencyC in [1, 2, 4] for swizzle in [True, False]],
     )
 
 
@@ -221,7 +242,7 @@ def test():
     import time
     import torch
     # Create input data
-    tile_m, tile_n, tile_k, latencyAB, latencyC = 32, 64, 128, 1, 2
+    tile_m, tile_n, tile_k, latencyAB, latencyC = 32, 32, 128, 4, 1
     M, N, K = 128, 1536, 8960
     grid = (ceil(M/tile_m) * ceil(N/tile_n), 1, 1)
     print("Grid size:", grid)
@@ -247,7 +268,7 @@ def test():
     torch.testing.assert_close(c, expected)
 
 
-    tile_m, tile_n, tile_k, latencyAB, latencyC  = 64, 32, 128, 2, 2
+    tile_m, tile_n, tile_k, latencyAB, latencyC  = 32, 32, 128, 4, 1
     b = torch.rand((N, K), device='cuda', dtype=torch.float16)  # transposed b
     total = bench_matmul(a, b, c, launch_matmul, iter=50, tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, latencyAB=latencyAB, latencyC=latencyC, act=0, transb=True)
     print(f"Kernel execution time with transposed B: {total:.4f} ms")
@@ -274,6 +295,22 @@ def test():
     print(f"Pytorch execution time with transposed B: {total*1000:.4f} ms")
     torch.testing.assert_close(c, expected)
     # torch.testing.assert_close(c2, expected)
+
+    # test with bias
+    bias = torch.rand((M, N), device='cuda', dtype=torch.float16)
+    tile_m, tile_n, tile_k, latencyAB, latencyC, swizzle  = 32, 32, 128, 4, 4, True
+    total = bench_matmul(a, b, c, launch_matmul, iter=50, tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, latencyAB=latencyAB, latencyC=latencyC, act=ACT_BIAS, transb=True, bias=bias, swizzle=swizzle)
+    print(f"Kernel execution time with transposed B + bias: {total:.4f} ms")
+
+    expected = torch.matmul(a, b.T) + bias
+    torch.cuda.synchronize()
+    start = time.time()
+    for _ in range(10):
+        expected = torch.matmul(a, b.T) + bias
+    torch.cuda.synchronize()
+    total = (time.time() - start)/10
+    print(f"Pytorch execution time with transposed B + bias: {total*1000:.4f} ms")
+    torch.testing.assert_close(c, expected)
 
     print("✓ matmul_example passed!")
 
@@ -315,8 +352,8 @@ def test_gemv():
 
 
 if __name__ == "__main__":
-    # test()
-    # test_gemv()
+    test()
+    test_gemv()
     # tune_matmul(torch.rand((128, 8960), device='cuda', dtype=torch.float16),
     #             torch.rand((8960, 1536), device='cuda', dtype=torch.float16),
     #             torch.zeros((128, 1536), device='cuda', dtype=torch.float16),
@@ -330,14 +367,15 @@ if __name__ == "__main__":
     #             cfgs, launch_matmul,
     #             act=0, transb=False)
     
-    from autotune_logger import setup_autotune_logger
-    setup_autotune_logger()
-    launch_matmul_auto_tune(torch.cuda.current_stream(),
-                            torch.rand((128, 8960), device='cuda', dtype=torch.float16),
-                            torch.rand((1536, 8960), device='cuda', dtype=torch.float16),
-                            torch.zeros((128, 1536), device='cuda', dtype=torch.float16),
-                            transb=True, act=0)
-    print("done")
+    # from autotune_logger import setup_autotune_logger
+    # setup_autotune_logger()
+    # launch_matmul_auto_tune(torch.cuda.current_stream(),
+    #                         torch.rand((128, 8960), device='cuda', dtype=torch.float16),
+    #                         torch.rand((1536, 8960), device='cuda', dtype=torch.float16),
+    #                         torch.zeros((128, 1536), device='cuda', dtype=torch.float16),
+    #                         torch.zeros((128, 1536), device='cuda', dtype=torch.float16),
+    #                         transb=True, act=ACT_BIAS)
+    # print("done")
 
     # tune gemv a @ b.T
     # cfgs = [{'tile_n': n, 'tile_k': k, 'split_k': splitk}  for n in [32,64,128] for k in [32,64,128] for splitk in [4,8,16]]
