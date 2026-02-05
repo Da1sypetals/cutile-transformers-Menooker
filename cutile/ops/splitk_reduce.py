@@ -14,6 +14,38 @@ ConstInt = ct.Constant[int]
 ConstBool = ct.Constant[bool]
 
 
+def apply_splitk_reduce(out_splitk: ct.Tile, lse_splitk: ct.Tile, dtype: ct.DType) -> ct.Tile:
+    NUM_KV_SPLITS_POW2, TILE_D = out_splitk.shape
+    lse_max = ct.max(lse_splitk)
+
+    # Compute sumexp_normalized_splitk
+    sumexp_normalized_splitk = ct.exp2(lse_splitk - lse_max)
+    sumexp_normalized_splitk = ct.astype(sumexp_normalized_splitk, ct.float32)
+
+    # Compute sumexp_normalized
+    sumexp_normalized = ct.sum(sumexp_normalized_splitk)
+
+    # Compute numerator_normalized
+    if NUM_KV_SPLITS_POW2 >= 16:
+        mma_result = ct.mma(
+            sumexp_normalized_splitk[None, :],
+            ct.astype(out_splitk, ct.float32),
+            ct.zeros((1, TILE_D), dtype=ct.float32),
+        )
+        numerator_normalized = ct.extract(mma_result, (0, 0), shape=(1, TILE_D))
+    else:
+        numerator_normalized = ct.sum(
+            out_splitk * ct.reshape(sumexp_normalized_splitk, (NUM_KV_SPLITS_POW2, 1)),
+            axis=0,
+        )
+
+    # Compute final accumulator
+    acc = numerator_normalized / sumexp_normalized
+
+    # Cast to output dtype before storing
+    acc = ct.astype(acc, dtype)
+    return acc
+
 @ct.kernel(occupancy=4)
 def splitk_reduce_kernel(
     attn_splitk_out,
@@ -54,37 +86,7 @@ def splitk_reduce_kernel(
         (batch_id, head_id, offs_lse),
         padding_value=-math.inf,
     )
-
-    # Compute lse_max
-    lse_max = ct.max(lse_splitk)
-
-    # Compute sumexp_normalized_splitk
-    sumexp_normalized_splitk = ct.exp2(lse_splitk - lse_max)
-    sumexp_normalized_splitk = ct.astype(sumexp_normalized_splitk, ct.float32)
-
-    # Compute sumexp_normalized
-    sumexp_normalized = ct.sum(sumexp_normalized_splitk)
-
-    # Compute numerator_normalized
-    if USE_DOT:
-        mma_result = ct.mma(
-            sumexp_normalized_splitk[None, :],
-            ct.astype(out_splitk, ct.float32),
-            ct.zeros((1, TILE_D), dtype=ct.float32),
-        )
-        numerator_normalized = ct.extract(mma_result, (0, 0), shape=(1, TILE_D))
-    else:
-        numerator_normalized = ct.sum(
-            out_splitk * ct.reshape(sumexp_normalized_splitk, (NUM_KV_SPLITS_POW2, 1)),
-            axis=0,
-        )
-
-    # Compute final accumulator
-    acc = numerator_normalized / sumexp_normalized
-
-    # Cast to output dtype before storing
-    acc = ct.astype(acc, dtype)
-
+    acc = apply_splitk_reduce(out_splitk, lse_splitk, dtype)
     # Store final result with latency hint
     ct.store(
         attn_out,

@@ -9,8 +9,8 @@ import math
 import cuda.tile as ct
 import torch
 from cuda.tile._numeric_semantics import RoundingMode as RMd
-from .splitk_reduce import splitk_reduce
-from .utils import next_power_of_2
+from cutile.ops.splitk_reduce import splitk_reduce, apply_splitk_reduce
+from cutile.ops.utils import next_power_of_2
 
 
 # Type aliases for constants
@@ -27,11 +27,6 @@ def attention_decode_kernel_grouped(
     Att_Out,
     LSE_Out,
     softmax_scale: float,
-    stride_mid_ob: int,
-    stride_mid_oh: int,
-    stride_mid_os: int,
-    stride_mid_lseb: int,
-    stride_mid_lsem: int,
     B: int,
     H_qo: int,
     H_kv: int,
@@ -143,7 +138,6 @@ def attention_decode_kernel_grouped(
 
     # Store attention output
     acc_reshaped = ct.reshape(acc, (1, 1, QUERY_GROUP_TILE_SIZE, 1, HEAD_DIM))
-
     if NUM_Q_HEAD_PER_KV == QUERY_GROUP_TILE_SIZE:
         # Use TMA store for optimal performance
         ct.store(
@@ -165,15 +159,16 @@ def attention_decode_kernel_grouped(
             latency=1,
         )
 
-    # Store log sum exp
-    idx_lse_q_offset = ct.arange(QUERY_GROUP_TILE_SIZE, dtype=ct.int32)
-    ct.scatter(
-        LSE_Out,
-        (batch_id, head_id, idx_lse_q_offset, tile_id),
-        l,
-        check_bounds=True,
-        latency=1,
-    )
+    if NUM_KV_SPLITS > 1:
+        # Store log sum exp
+        idx_lse_q_offset = ct.arange(QUERY_GROUP_TILE_SIZE, dtype=ct.int32)
+        ct.scatter(
+            LSE_Out,
+            (batch_id, head_id, idx_lse_q_offset, tile_id),
+            l,
+            check_bounds=True,
+            latency=1,
+        )
 
 NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 def attention_decode(stream: torch.cuda.Stream, out: torch.Tensor, Q, K, V, softmax_scale, kv_len_per_split=None):
@@ -219,16 +214,20 @@ def attention_decode(stream: torch.cuda.Stream, out: torch.Tensor, Q, K, V, soft
 
         # Allocate intermediate results
         device = Q.device
-        Att_Mid_Out = torch.empty(
-            (batch_size, num_q_heads, NUM_KV_SPLITS, head_dim),
-            device=device,
-            dtype=Q.dtype,
-        )
-        LSE_Out = torch.empty(
-            (batch_size, num_q_heads, NUM_KV_SPLITS),
-            device=device,
-            dtype=torch.float32,
-        )
+        if NUM_KV_SPLITS > 1:
+            Att_Mid_Out = torch.empty(
+                (batch_size, num_q_heads, NUM_KV_SPLITS, head_dim),
+                device=device,
+                dtype=Q.dtype,
+            )
+            LSE_Out = torch.empty(
+                (batch_size, num_q_heads, NUM_KV_SPLITS),
+                device=device,
+                dtype=torch.float32,
+            )
+        else:
+            Att_Mid_Out = out.view(batch_size, num_q_heads, NUM_KV_SPLITS, head_dim)
+            LSE_Out = 0
 
         # Calculate grouped attention parameters
         assert num_q_heads % num_kv_heads == 0
@@ -243,23 +242,16 @@ def attention_decode(stream: torch.cuda.Stream, out: torch.Tensor, Q, K, V, soft
             NUM_KV_SPLITS,
             head_dim,
         )
-        LSE_Out_4D = LSE_Out.view(
-            batch_size,
-            num_kv_heads,
-            num_q_head_per_kv,
-            NUM_KV_SPLITS,
-        )
+        if NUM_KV_SPLITS > 1:
+            LSE_Out_4D = LSE_Out.view(
+                batch_size,
+                num_kv_heads,
+                num_q_head_per_kv,
+                NUM_KV_SPLITS,
+            )
+        else:
+            LSE_Out_4D = 0
 
-        # Calculate strides
-        stride_mid_ob, stride_mid_oh, stride_mid_os = (
-            Att_Mid_Out.stride(0),
-            Att_Mid_Out.stride(1),
-            Att_Mid_Out.stride(2),
-        )
-        stride_mid_lseb, stride_mid_lsem = (
-            LSE_Out.stride(0),
-            LSE_Out.stride(1),
-        )
 
         # Round up head_dim to next power of 2
         HEAD_DIM = next_power_of_2(head_dim)
@@ -286,11 +278,6 @@ def attention_decode(stream: torch.cuda.Stream, out: torch.Tensor, Q, K, V, soft
                 Att_Mid_Out_5D,
                 LSE_Out_4D,
                 softmax_scale,
-                stride_mid_ob,
-                stride_mid_oh,
-                stride_mid_os,
-                stride_mid_lseb,
-                stride_mid_lsem,
                 batch_size,
                 num_q_heads,
                 num_kv_heads,
@@ -303,8 +290,52 @@ def attention_decode(stream: torch.cuda.Stream, out: torch.Tensor, Q, K, V, soft
                 NUM_KV_SPLITS,
             ),
         )
-
-        # Reduce kernel splitk results
-        splitk_reduce(stream, Att_Mid_Out, LSE_Out, out.view(batch_size, num_q_heads, head_dim), seq_len)
-
+        if NUM_KV_SPLITS > 1:
+            # Reduce kernel splitk results
+            splitk_reduce(stream, Att_Mid_Out, LSE_Out, out.view(batch_size, num_q_heads, head_dim), seq_len)
         return out
+
+if __name__ == "__main__":
+    # qwen2.5-1.5b
+    # q2.shape: torch.Size([1, 128, 12, 128]) k.shape: torch.Size([1, 2, 128, 128]) v.shape: torch.Size([1, 2, 128, 128])
+    # o.shape: torch.Size([1, 128, 12, 128])
+    # sm_scale: 0.08838834764831845 input_pos: 0 hidden_size: 128
+    # num_heads: 12 query_group_size: 6 is_causal: True EVEN_K: True
+    import torch
+    q2 = torch.randn((1, 1, 12, 128), dtype=torch.float16, device='cuda')
+    q = q2.transpose(1, 2)
+    k = torch.randn((1, 2, 256, 128), dtype=torch.float16, device='cuda')
+    v = torch.randn((1, 2, 256, 128), dtype=torch.float16, device='cuda')
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+    import time
+    from types import SimpleNamespace
+    sdpa = ALL_ATTENTION_FUNCTIONS["sdpa"]
+
+    module = SimpleNamespace(num_key_value_groups=6)
+    # enable cuda.tile_experimental._autotuner logging for debug
+    # import logging
+    # logging.basicConfig(level=logging.DEBUG)
+    # ct_experimental._autotuner.logger.setLevel(logging.DEBUG)
+
+    stream = torch.cuda.current_stream()
+    out = torch.empty_like(q2)
+    o1 = attention_decode(stream, out, q, k, v, 0.08838834764831845)
+    torch.cuda.synchronize()
+    start_time = time.time()
+    for _ in range(10):
+        o1 = attention_decode(stream, out, q, k, v, 0.08838834764831845)
+    torch.cuda.synchronize()
+    end_time = time.time()
+    print(f"Time taken for fmha_decode: {(end_time - start_time) * 1000/10} ms")
+
+    position_ids = torch.tensor([[255]], device='cuda')
+    o = sdpa(module, q, k, v, is_causal=None, attention_mask=None, position_ids=position_ids, sliding_window=None, use_cache = True)
+    torch.cuda.synchronize()
+    start_time = time.time()
+    for _ in range(10):
+        o, _ = sdpa(module, q, k, v, is_causal=None, attention_mask=None, position_ids=position_ids, sliding_window=None, use_cache = True)
+    torch.cuda.synchronize()
+    end_time = time.time()
+    print(f"Time taken for sdpa: {(end_time - start_time) * 1000/10} ms")
+
+    # torch.testing.assert_close(o1, o, atol=1e-4, rtol=1e-3)
