@@ -1,29 +1,59 @@
+# cutile-lsp: on
 
-import cuda.tile as ct
+import cuda.tile_experimental as ct_experimental  # noqa
+
 from math import ceil
-import torch
-import cuda.tile_experimental as ct_experimental
 from types import SimpleNamespace
 
-def silu_and_mul(x, y, approx: bool):
-    '''
+# cutile-lsp: start
+import cuda.tile as ct
+import torch
+
+
+def silu_and_mul(
+    x,
+    y,
+    approx: bool,
+):
+    """
     SiLU(x) * y
     SiLU(x) = x / (1 + exp(-x))
     approx: whether to use approximate exp
-    '''
+    """
     denom = ct.add(1, ct.exp(-x), flush_to_zero=True)
     rounding_mode = ct.RoundingMode.APPROX if approx else None
     sigmoid_x = ct.truediv(1.0, denom, flush_to_zero=True, rounding_mode=rounding_mode)
     silu = ct.mul(x, sigmoid_x, flush_to_zero=True)
     return ct.mul(silu, y, flush_to_zero=True)
 
+
 @ct.kernel(occupancy=ct.ByTarget(sm_120=2))
-def matmul_silu_mul(a, b1, b2, c, TILE_M: ct.Constant[int], TILE_N: ct.Constant[int], TILE_K: ct.Constant[int], approx: ct.Constant[bool]):
-    '''
+def matmul_silu_mul(
+    a,
+    b1,
+    b2,
+    c,
+    TILE_M: ct.Constant[int],
+    TILE_N: ct.Constant[int],
+    TILE_K: ct.Constant[int],
+    approx: ct.Constant[bool],
+):
+    """
     perform C = SiLU(A @ B1^T) * (A @ B2^T)
-    '''
+
+    <typecheck>
+    Tensor((128, 1536), dtype="float16")
+    Tensor((8960, 1536), dtype="float16")
+    Tensor((8960, 1536), dtype="float16")
+    Tensor((128, 8960), dtype="float16")
+    64
+    64
+    128
+    True
+    </typecheck>
+    """
     pid = ct.bid(0)
-    M,K = a.shape[0], a.shape[1]
+    M, K = a.shape[0], a.shape[1]
     N = b1.shape[0]
     num_tiles_m = ct.cdiv(M, TILE_M)
     num_tiles_n = ct.cdiv(N, TILE_N)
@@ -49,38 +79,88 @@ def matmul_silu_mul(a, b1, b2, c, TILE_M: ct.Constant[int], TILE_N: ct.Constant[
     # Store result
     ct.store(c, index=(m_idx, n_idx), tile=result)
 
-def launch_matmul_silu_mul(stream: torch.cuda.Stream, a: torch.Tensor, b1: torch.Tensor, b2: torch.Tensor, c: torch.Tensor, approx: bool = True):
+
+def launch_matmul_silu_mul(
+    stream: torch.cuda.Stream,
+    a: torch.Tensor,
+    b1: torch.Tensor,
+    b2: torch.Tensor,
+    c: torch.Tensor,
+    approx: bool = True,
+):
     M, N, K = a.shape[0], c.shape[1], a.shape[1]
-    
+
     tile_m, tile_n, tile_k = 64, 64, 128
-    grid = (ceil(M/tile_m) * ceil(N/tile_n), 1, 1)
+    grid = (ceil(M / tile_m) * ceil(N / tile_n), 1, 1)
     assert b1.shape == (N, K)
     assert b2.shape == (N, K)
-    ct.launch(stream,
-            grid,  # 1D grid of processors
-            matmul_silu_mul,
-            (a, b1, b2, c, tile_m, tile_n, tile_k, approx))
-def launch_matmul_silu_mul_auto_tune(stream: torch.cuda.Stream, a: torch.Tensor, b1: torch.Tensor, b2: torch.Tensor, c: torch.Tensor, approx: bool = True):
+    ct.launch(
+        stream,
+        grid,  # 1D grid of processors
+        matmul_silu_mul,
+        (a, b1, b2, c, tile_m, tile_n, tile_k, approx),
+    )
+
+
+def launch_matmul_silu_mul_auto_tune(
+    stream: torch.cuda.Stream,
+    a: torch.Tensor,
+    b1: torch.Tensor,
+    b2: torch.Tensor,
+    c: torch.Tensor,
+    approx: bool = True,
+):
     M, N, K = a.shape[0], c.shape[1], a.shape[1]
     assert b1.shape == (N, K)
     assert b2.shape == (N, K)
     ct_experimental.autotune_launch(
         stream,
-        grid_fn=lambda cfg: (ceil(M/cfg.tile_m) * ceil(N/cfg.tile_n), 1, 1),
+        grid_fn=lambda cfg: (ceil(M / cfg.tile_m) * ceil(N / cfg.tile_n), 1, 1),
         kernel=matmul_silu_mul,
         args_fn=lambda cfg: (a, b1, b2, c, cfg.tile_m, cfg.tile_n, cfg.tile_k, approx),
         hints_fn=lambda cfg: {
             "occupancy": cfg.occupancy,
         },
-        search_space=[SimpleNamespace(tile_m=TM, tile_n=TN, tile_k=TK, occupancy=occupancy)
-                for TM in [32, 64] for TN in [32, 64, 128] for TK in [32, 64, 128] for occupancy in [1, 2, 4, 8]],
+        search_space=[
+            SimpleNamespace(tile_m=TM, tile_n=TN, tile_k=TK, occupancy=occupancy)
+            for TM in [32, 64]
+            for TN in [32, 64, 128]
+            for TK in [32, 64, 128]
+            for occupancy in [1, 2, 4, 8]
+        ],
     )
 
+
 ConstInt = ct.Constant[int]
+
+
 @ct.kernel(occupancy=ct.ByTarget(sm_120=8))
-def gemv_silu_mul_split_k_kernel(A, B1, B2, C, f32acc, COUNTS,
-                          tn: ConstInt, tk: ConstInt,
-                          SPLIT_K: ConstInt, approx: ct.Constant[bool]):
+def gemv_silu_mul_split_k_kernel(
+    A,
+    B1,
+    B2,
+    C,
+    f32acc,
+    COUNTS,
+    tn: ConstInt,
+    tk: ConstInt,
+    SPLIT_K: ConstInt,
+    approx: ct.Constant[bool],
+):
+    """
+    <typecheck>
+    Tensor((1, 1536), dtype="float16")
+    Tensor((8960, 1536), dtype="float16")
+    Tensor((8960, 1536), dtype="float16")
+    Tensor((1, 8960), dtype="float16")
+    Tensor((2, 8960), dtype="float32")
+    Tensor((280,), dtype="int32")
+    32
+    64
+    8
+    True
+    </typecheck>
+    """
     GROUP_SIZE_M = 1
     M = 1
     N = B1.shape[1]
@@ -99,14 +179,13 @@ def gemv_silu_mul_split_k_kernel(A, B1, B2, C, f32acc, COUNTS,
     split_size = ct.cdiv(num_tiles_k, SPLIT_K)
     for k in range(bidz * split_size, bidz * split_size + split_size, 1):
         # tile a has only one effective row, of shape tk. It is not efficient to use TMA to load it.
-        a = ct.load(A, index=(bidx, k), shape=(fake_tm, tk),
-                    padding_mode=zero_pad, allow_tma=False).astype(dtype)
-        b1 = ct.load(B1, index=(bidy, k), shape=(tn, tk),
-                    padding_mode=zero_pad).astype(dtype)
+        a = ct.load(A, index=(bidx, k), shape=(fake_tm, tk), padding_mode=zero_pad, allow_tma=False).astype(
+            dtype
+        )
+        b1 = ct.load(B1, index=(bidy, k), shape=(tn, tk), padding_mode=zero_pad).astype(dtype)
         b1 = ct.transpose(b1)
         sum1 = ct.mma(a, b1, sum1)
-        b2 = ct.load(B2, index=(bidy, k), shape=(tn, tk),
-                    padding_mode=zero_pad).astype(dtype)
+        b2 = ct.load(B2, index=(bidy, k), shape=(tn, tk), padding_mode=zero_pad).astype(dtype)
         b2 = ct.transpose(b2)
         sum2 = ct.mma(a, b2, sum2)
     # only the first row of sum is needed
@@ -130,52 +209,63 @@ def gemv_silu_mul_split_k_kernel(A, B1, B2, C, f32acc, COUNTS,
         ct.scatter(f32acc, (1, C_offset), 0)
         ct.scatter(COUNTS, count_offset, 0)
 
+
+# cutile-lsp: end
+
 # Global cache for gemv buffers to avoid reallocation on every call
 
 _gemv_f32acc = None
 _gemv_counts = None
-def launch_gemv_silu_mul(stream: torch.cuda.Stream, a: torch.Tensor, b1: torch.Tensor, b2: torch.Tensor, c: torch.Tensor, approx: bool = True):
+
+
+def launch_gemv_silu_mul(
+    stream: torch.cuda.Stream,
+    a: torch.Tensor,
+    b1: torch.Tensor,
+    b2: torch.Tensor,
+    c: torch.Tensor,
+    approx: bool = True,
+):
     global _gemv_f32acc, _gemv_counts
-    
+
     split_k, tile_n, tile_k = 8, 32, 64
     M, N, K = a.shape[0], c.shape[1], a.shape[1]
-    grid = (ceil(N/tile_n), split_k, 1)
+    grid = (ceil(N / tile_n), split_k, 1)
     assert b1.shape == (N, K)
     assert b2.shape == (N, K)
     assert M == 1
 
     # Reuse global buffers, reallocate only if needed
     if _gemv_f32acc is None or _gemv_f32acc.shape[1] < N:
-        _gemv_f32acc = torch.zeros((2, N), device='cuda', dtype=torch.float32)
+        _gemv_f32acc = torch.zeros((2, N), device="cuda", dtype=torch.float32)
     if _gemv_counts is None or _gemv_counts.shape[0] < grid[0]:
-        _gemv_counts = torch.zeros((grid[0],), device='cuda', dtype=torch.int32)
+        _gemv_counts = torch.zeros((grid[0],), device="cuda", dtype=torch.int32)
     args = (a, b1, b2, c, _gemv_f32acc, _gemv_counts, tile_n, tile_k, split_k, False)
-    ct.launch(stream,
-            grid,
-            gemv_silu_mul_split_k_kernel,
-            args)
+    ct.launch(stream, grid, gemv_silu_mul_split_k_kernel, args)
 
 
 def test_matmul():
     import time
+
     import torch
+
     # Create input data
     M, N, K = 128, 8960, 1536
 
-    a = torch.rand((M, K), device='cuda', dtype=torch.float16)/100
-    b1 = torch.rand((N, K), device='cuda', dtype=torch.float16)/100
-    b2 = torch.rand((N, K), device='cuda', dtype=torch.float16)/100
-    c = torch.zeros((M, N), device='cuda', dtype=torch.float16)
+    a = torch.rand((M, K), device="cuda", dtype=torch.float16) / 100
+    b1 = torch.rand((N, K), device="cuda", dtype=torch.float16) / 100
+    b2 = torch.rand((N, K), device="cuda", dtype=torch.float16) / 100
+    c = torch.zeros((M, N), device="cuda", dtype=torch.float16)
 
     # Launch kernel
 
-    #benchmark this
+    # benchmark this
 
     stream = torch.cuda.current_stream()
     # show debug DEBUG level logs
     # import logging
     # logging.basicConfig(level=logging.DEBUG)
-    
+
     # launch_matmul_silu_mul_auto_tune(stream, a, b1, b2, c, True)
     launch_matmul_silu_mul(stream, a, b1, b2, c, True)
     torch.cuda.synchronize()
@@ -183,8 +273,8 @@ def test_matmul():
     for _ in range(10):
         launch_matmul_silu_mul(stream, a, b1, b2, c, True)
     torch.cuda.synchronize()
-    total = (time.time() - start)/10
-    print(f"matmul_silu_mul kernel time for 10 runs: {total*1000:.4f} ms")
+    total = (time.time() - start) / 10
+    print(f"matmul_silu_mul kernel time for 10 runs: {total * 1000:.4f} ms")
 
     with torch.no_grad():
         L1 = torch.nn.Linear(K, N, bias=False, device=a.device, dtype=torch.float16)
@@ -201,24 +291,26 @@ def test_matmul():
             c2 = L2(a)
             expected = c1 * torch.sigmoid(c1) * c2
         torch.cuda.synchronize()
-    total = (time.time() - start)/10
-    print(f"pytorch kernel time for 10 runs: {total*1000:.4f} ms")
+    total = (time.time() - start) / 10
+    print(f"pytorch kernel time for 10 runs: {total * 1000:.4f} ms")
     torch.testing.assert_close(c, expected)
 
     print("✓ matmul_silu_mul passed!")
 
 
-#qwen2 
-#launch_matmul_silu_mul torch.Size([1, 1536]) torch.Size([8960, 1536])
+# qwen2
+# launch_matmul_silu_mul torch.Size([1, 1536]) torch.Size([8960, 1536])
 def test_gemv_split_k():
     import time
+
     import torch
+
     M, N, K = 1, 8960, 1536
     split_k = 16
-    a = torch.rand((M, K), device='cuda', dtype=torch.float16)/100
-    b1 = torch.rand((N, K), device='cuda', dtype=torch.float16)/100
-    b2 = torch.rand((N, K), device='cuda', dtype=torch.float16)/100
-    c = torch.zeros((M, N), device='cuda', dtype=torch.float16)
+    a = torch.rand((M, K), device="cuda", dtype=torch.float16) / 100
+    b1 = torch.rand((N, K), device="cuda", dtype=torch.float16) / 100
+    b2 = torch.rand((N, K), device="cuda", dtype=torch.float16) / 100
+    c = torch.zeros((M, N), device="cuda", dtype=torch.float16)
 
     stream = torch.cuda.current_stream()
     # tile_n, tile_k = 64, 64
@@ -236,8 +328,8 @@ def test_gemv_split_k():
     for _ in range(10):
         launch_gemv_silu_mul(stream, a, b1, b2, c, False)
     torch.cuda.synchronize()
-    total = (time.time() - start)/10
-    print(f"gemv_silu_mul_split_k kernel time for 10 runs: {total*1000:.4f} ms")
+    total = (time.time() - start) / 10
+    print(f"gemv_silu_mul_split_k kernel time for 10 runs: {total * 1000:.4f} ms")
 
     c1 = torch.matmul(a, b1.T)
     c2 = torch.matmul(a, b2.T)
@@ -249,8 +341,8 @@ def test_gemv_split_k():
         c2 = torch.matmul(a, b2.T)
         expected = c1 * torch.sigmoid(c1) * c2
     torch.cuda.synchronize()
-    total = (time.time() - start)/10
-    print(f"pytorch kernel time for 10 runs: {total*1000:.4f} ms")
+    total = (time.time() - start) / 10
+    print(f"pytorch kernel time for 10 runs: {total * 1000:.4f} ms")
     torch.testing.assert_close(c, expected)
 
     print("✓ gemv_silu_mul_split_k passed!")

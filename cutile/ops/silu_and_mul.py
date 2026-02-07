@@ -1,4 +1,8 @@
+# cutile-lsp: on
 # modified from https://github.com/NVIDIA/TileGym/blob/main/src/tilegym/ops/cutile/silu_and_mul.py
+
+# cutile-lsp: start
+
 import cuda.tile as ct
 import torch
 from cuda.tile._numeric_semantics import RoundingMode as RMd
@@ -15,6 +19,15 @@ def silu_and_mul(
     hidden_size,
     approx: ct.Constant[bool],
 ):
+    """
+    <typecheck>
+    Tensor((8, 256), dtype="float16")
+    Tensor((8, 128), dtype="float16")
+    128
+    128
+    True
+    </typecheck>
+    """
     bid = ct.bid(0)  # this gives us our row
     offsets = ct.arange(TILE_SIZE, dtype=torch.int32)
 
@@ -43,6 +56,8 @@ def silu_and_mul(
     # output is also 2D: (batch_size, hidden_size)
     out_col_idx = offsets
     ct.scatter(output, (row_idx, out_col_idx), result, check_bounds=True)
+
+# cutile-lsp: end
 
 def launch_silu_and_mul(input: torch.Tensor, output: torch.Tensor, approx: bool = True):
     """

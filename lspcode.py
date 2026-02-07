@@ -1,11 +1,3 @@
-# cutile-lsp: on
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-#
-# SPDX-License-Identifier: MIT
-
-from .utils import next_power_of_2  # noqa
-import torch  # noqa
-
 # cutile-lsp: start
 import math
 
@@ -17,13 +9,8 @@ ConstInt = ct.Constant[int]
 ConstBool = ct.Constant[bool]
 
 
-def apply_splitk_reduce(
-    out_splitk: ct.Tile,
-    lse_splitk: ct.Tile,
-    dtype: ct.DType,
-    NUM_KV_SPLITS_POW2: ct.Constant,
-    TILE_D: ct.Constant,
-) -> ct.Tile:
+def apply_splitk_reduce(out_splitk: ct.Tile, lse_splitk: ct.Tile, dtype: ct.DType) -> ct.Tile:
+    NUM_KV_SPLITS_POW2, TILE_D = out_splitk.shape
     lse_max = ct.max(lse_splitk)
 
     # Compute sumexp_normalized_splitk
@@ -110,7 +97,7 @@ def splitk_reduce_kernel(
         (batch_id, head_id, offs_lse),
         padding_value=-math.inf,
     )
-    acc = apply_splitk_reduce(out_splitk, lse_splitk, dtype, NUM_KV_SPLITS_POW2, TILE_D)
+    acc = apply_splitk_reduce(out_splitk, lse_splitk, dtype)
     # Store final result with latency hint
     ct.store(
         attn_out,
@@ -123,3 +110,45 @@ def splitk_reduce_kernel(
 
 
 # cutile-lsp: end
+
+
+import json
+import traceback
+from pathlib import Path
+
+import cuda.tile as ct
+from cuda.tile._exception import Loc, TileError
+
+from cutile_lsp.lsp_pipeline.drive_compiler_pipeline import Tensor, check_semantics_and_type
+
+
+if __name__ == "__main__":
+    _hints = []
+    _diagnostics = []
+
+    # Launch func definitions, code is indented outside
+
+    def launc_splitk_reduce_kernel(_hints, _diagnostics):
+        args = (
+            Tensor((1, 12, 8, 128), dtype="float16"),
+            Tensor((1, 12, 8), dtype="float32"),
+            Tensor((1, 12, 128), dtype="float16"),
+            1,
+            256,
+            12,
+            128,
+            8,
+            8,
+            128,
+            True,
+        )
+        type_info = check_semantics_and_type(splitk_reduce_kernel, args)
+        _hints.extend(type_info)
+
+    # Launch kernels, code is indented outside
+    launc_splitk_reduce_kernel(_hints, _diagnostics)
+
+    # Save hints, code is indented outside
+    lsp_code_exec_results = dict(hints=_hints, diagnostics=_diagnostics)
+    with open("/home/da1sypetals/.cutile_lsp/1f06a1169c3002e5/lsp_code_exec_results.json", "w") as f:
+        json.dump(lsp_code_exec_results, f)

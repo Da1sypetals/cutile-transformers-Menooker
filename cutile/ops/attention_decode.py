@@ -1,16 +1,20 @@
+# cutile-lsp: on
+
+
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # SPDX-License-Identifier: MIT
 
 # modified from https://github.com/NVIDIA/TileGym/blob/86e24c2c97956c0fee4435296c8f2bced1a78f14/src/tilegym/ops/cutile/flash_decode.py
 
+from utils import next_power_of_2  # noqa
+# cutile-lsp: start
+
 import math
 
 import cuda.tile as ct
 import torch
 from cuda.tile._numeric_semantics import RoundingMode as RMd
-from cutile.ops.splitk_reduce import splitk_reduce, apply_splitk_reduce
-from cutile.ops.utils import next_power_of_2
 
 
 # Type aliases for constants
@@ -38,6 +42,26 @@ def attention_decode_kernel_grouped(
     QUERY_GROUP_TILE_SIZE: ConstInt,
     NUM_KV_SPLITS: ConstInt,
 ):
+    """
+    <typecheck>
+    Tensor((1, 2, 6, 128), dtype="float16")
+    Tensor((1, 2, 256, 128), dtype="float16")
+    Tensor((1, 2, 256, 128), dtype="float16")
+    Tensor((1, 2, 6, 8, 128), dtype="float16")
+    Tensor((1, 2, 6, 8), dtype="float32")
+    0.08838834764831845
+    1
+    12
+    2
+    256
+    128
+    128
+    256
+    6
+    8
+    8
+    </typecheck>
+    """
     # Get program IDs
     batch_id = ct.bid(0)
     head_id = ct.bid(1)
@@ -170,130 +194,139 @@ def attention_decode_kernel_grouped(
             latency=1,
         )
 
+
+# cutile-lsp: end
+
+from splitk_reduce import splitk_reduce
+
 NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
-def attention_decode(stream: torch.cuda.Stream, out: torch.Tensor, Q, K, V, softmax_scale, kv_len_per_split=None):
-        """
-        Grouped Query Attention implementation using attention_decode_kernel_grouped.
-        Supports both standard attention (num_q_heads == num_kv_heads) and
-        grouped attention (num_q_heads != num_kv_heads) cases.
 
-        Args:
-            Q: Query tensor of shape [batch_size, num_q_heads, 1, head_dim]
-            K: Key tensor of shape [batch_size, num_kv_heads, seq_len, head_dim]
-            V: Value tensor of shape [batch_size, num_kv_heads, seq_len, head_dim]
-            softmax_scale: Scale factor for attention computation
-            kv_len_per_split: Optional KV length per split for parallelization
 
-        Returns:
-            O: Output tensor of shape [batch_size, num_q_heads, 1, head_dim]
-        """
-        # Get dimensions
-        batch_size, num_q_heads = Q.shape[0], Q.shape[1]
-        num_kv_heads = K.shape[1]
-        seq_len, head_dim = V.shape[2], V.shape[3]
+def attention_decode(
+    stream: torch.cuda.Stream, out: torch.Tensor, Q, K, V, softmax_scale, kv_len_per_split=None
+):
+    """
+    Grouped Query Attention implementation using attention_decode_kernel_grouped.
+    Supports both standard attention (num_q_heads == num_kv_heads) and
+    grouped attention (num_q_heads != num_kv_heads) cases.
 
-        # Reshape for processing
-        Q = Q.view(batch_size, num_q_heads, head_dim)
-        K = K.view(batch_size, num_kv_heads, seq_len, head_dim)
-        V = V.view(batch_size, num_kv_heads, seq_len, head_dim)
+    Args:
+        Q: Query tensor of shape [batch_size, num_q_heads, 1, head_dim]
+        K: Key tensor of shape [batch_size, num_kv_heads, seq_len, head_dim]
+        V: Value tensor of shape [batch_size, num_kv_heads, seq_len, head_dim]
+        softmax_scale: Scale factor for attention computation
+        kv_len_per_split: Optional KV length per split for parallelization
 
-        # Calculate number of tiles
-        TILE_N = 128
-        if kv_len_per_split is None:
-            NUM_KV_SPLITS = NUM_SMS // (batch_size * num_kv_heads)
-            TILE_SIZE = max(
-                TILE_N,
-                next_power_of_2((seq_len + NUM_KV_SPLITS - 1) // NUM_KV_SPLITS),
-            )
-            NUM_KV_SPLITS = (seq_len + TILE_SIZE - 1) // TILE_SIZE
-        else:
-            NUM_KV_SPLITS = (seq_len + kv_len_per_split - 1) // kv_len_per_split
-            TILE_SIZE = kv_len_per_split
+    Returns:
+        O: Output tensor of shape [batch_size, num_q_heads, 1, head_dim]
+    """
+    # Get dimensions
+    batch_size, num_q_heads = Q.shape[0], Q.shape[1]
+    num_kv_heads = K.shape[1]
+    seq_len, head_dim = V.shape[2], V.shape[3]
 
-        assert TILE_SIZE == next_power_of_2(TILE_SIZE)
+    # Reshape for processing
+    Q = Q.view(batch_size, num_q_heads, head_dim)
+    K = K.view(batch_size, num_kv_heads, seq_len, head_dim)
+    V = V.view(batch_size, num_kv_heads, seq_len, head_dim)
 
-        # Allocate intermediate results
-        device = Q.device
-        if NUM_KV_SPLITS > 1:
-            Att_Mid_Out = torch.empty(
-                (batch_size, num_q_heads, NUM_KV_SPLITS, head_dim),
-                device=device,
-                dtype=Q.dtype,
-            )
-            LSE_Out = torch.empty(
-                (batch_size, num_q_heads, NUM_KV_SPLITS),
-                device=device,
-                dtype=torch.float32,
-            )
-        else:
-            Att_Mid_Out = out.view(batch_size, num_q_heads, NUM_KV_SPLITS, head_dim)
-            LSE_Out = 0
+    # Calculate number of tiles
+    TILE_N = 128
+    if kv_len_per_split is None:
+        NUM_KV_SPLITS = NUM_SMS // (batch_size * num_kv_heads)
+        TILE_SIZE = max(
+            TILE_N,
+            next_power_of_2((seq_len + NUM_KV_SPLITS - 1) // NUM_KV_SPLITS),
+        )
+        NUM_KV_SPLITS = (seq_len + TILE_SIZE - 1) // TILE_SIZE
+    else:
+        NUM_KV_SPLITS = (seq_len + kv_len_per_split - 1) // kv_len_per_split
+        TILE_SIZE = kv_len_per_split
 
-        # Calculate grouped attention parameters
-        assert num_q_heads % num_kv_heads == 0
-        num_q_head_per_kv = num_q_heads // num_kv_heads
-        query_group_tile_size = max(8, next_power_of_2(num_q_head_per_kv))
+    assert TILE_SIZE == next_power_of_2(TILE_SIZE)
 
-        # Create grouped views for kernel
-        Att_Mid_Out_5D = Att_Mid_Out.view(
+    # Allocate intermediate results
+    device = Q.device
+    if NUM_KV_SPLITS > 1:
+        Att_Mid_Out = torch.empty(
+            (batch_size, num_q_heads, NUM_KV_SPLITS, head_dim),
+            device=device,
+            dtype=Q.dtype,
+        )
+        LSE_Out = torch.empty(
+            (batch_size, num_q_heads, NUM_KV_SPLITS),
+            device=device,
+            dtype=torch.float32,
+        )
+    else:
+        Att_Mid_Out = out.view(batch_size, num_q_heads, NUM_KV_SPLITS, head_dim)
+        LSE_Out = 0
+
+    # Calculate grouped attention parameters
+    assert num_q_heads % num_kv_heads == 0
+    num_q_head_per_kv = num_q_heads // num_kv_heads
+    query_group_tile_size = max(8, next_power_of_2(num_q_head_per_kv))
+
+    # Create grouped views for kernel
+    Att_Mid_Out_5D = Att_Mid_Out.view(
+        batch_size,
+        num_kv_heads,
+        num_q_head_per_kv,
+        NUM_KV_SPLITS,
+        head_dim,
+    )
+    if NUM_KV_SPLITS > 1:
+        LSE_Out_4D = LSE_Out.view(
             batch_size,
             num_kv_heads,
             num_q_head_per_kv,
             NUM_KV_SPLITS,
-            head_dim,
         )
-        if NUM_KV_SPLITS > 1:
-            LSE_Out_4D = LSE_Out.view(
-                batch_size,
-                num_kv_heads,
-                num_q_head_per_kv,
-                NUM_KV_SPLITS,
-            )
-        else:
-            LSE_Out_4D = 0
+    else:
+        LSE_Out_4D = 0
 
+    # Round up head_dim to next power of 2
+    HEAD_DIM = next_power_of_2(head_dim)
 
-        # Round up head_dim to next power of 2
-        HEAD_DIM = next_power_of_2(head_dim)
+    # Reshape Q for grouped query attention
+    Q_grouped = Q.view(
+        batch_size,
+        num_q_heads // num_q_head_per_kv,
+        num_q_head_per_kv,
+        head_dim,
+    )
 
-        # Reshape Q for grouped query attention
-        Q_grouped = Q.view(
+    # Launch kernel
+    grid = (batch_size, num_kv_heads, NUM_KV_SPLITS)
+
+    ct.launch(
+        stream,
+        grid,
+        attention_decode_kernel_grouped,
+        (
+            Q_grouped,
+            K,
+            V,
+            Att_Mid_Out_5D,
+            LSE_Out_4D,
+            softmax_scale,
             batch_size,
-            num_q_heads // num_q_head_per_kv,
+            num_q_heads,
+            num_kv_heads,
+            seq_len,
+            HEAD_DIM,
+            TILE_N,
+            TILE_SIZE,
             num_q_head_per_kv,
-            head_dim,
-        )
+            query_group_tile_size,
+            NUM_KV_SPLITS,
+        ),
+    )
+    if NUM_KV_SPLITS > 1:
+        # Reduce kernel splitk results
+        splitk_reduce(stream, Att_Mid_Out, LSE_Out, out.view(batch_size, num_q_heads, head_dim), seq_len)
+    return out
 
-        # Launch kernel
-        grid = (batch_size, num_kv_heads, NUM_KV_SPLITS)
-
-        ct.launch(
-            stream,
-            grid,
-            attention_decode_kernel_grouped,
-            (
-                Q_grouped,
-                K,
-                V,
-                Att_Mid_Out_5D,
-                LSE_Out_4D,
-                softmax_scale,
-                batch_size,
-                num_q_heads,
-                num_kv_heads,
-                seq_len,
-                HEAD_DIM,
-                TILE_N,
-                TILE_SIZE,
-                num_q_head_per_kv,
-                query_group_tile_size,
-                NUM_KV_SPLITS,
-            ),
-        )
-        if NUM_KV_SPLITS > 1:
-            # Reduce kernel splitk results
-            splitk_reduce(stream, Att_Mid_Out, LSE_Out, out.view(batch_size, num_q_heads, head_dim), seq_len)
-        return out
 
 if __name__ == "__main__":
     # qwen2.5-1.5b
@@ -302,13 +335,16 @@ if __name__ == "__main__":
     # sm_scale: 0.08838834764831845 input_pos: 0 hidden_size: 128
     # num_heads: 12 query_group_size: 6 is_causal: True EVEN_K: True
     import torch
-    q2 = torch.randn((1, 1, 12, 128), dtype=torch.float16, device='cuda')
+
+    q2 = torch.randn((1, 1, 12, 128), dtype=torch.float16, device="cuda")
     q = q2.transpose(1, 2)
-    k = torch.randn((1, 2, 256, 128), dtype=torch.float16, device='cuda')
-    v = torch.randn((1, 2, 256, 128), dtype=torch.float16, device='cuda')
-    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+    k = torch.randn((1, 2, 256, 128), dtype=torch.float16, device="cuda")
+    v = torch.randn((1, 2, 256, 128), dtype=torch.float16, device="cuda")
     import time
     from types import SimpleNamespace
+
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
     sdpa = ALL_ATTENTION_FUNCTIONS["sdpa"]
 
     module = SimpleNamespace(num_key_value_groups=6)
@@ -326,16 +362,36 @@ if __name__ == "__main__":
         o1 = attention_decode(stream, out, q, k, v, 0.08838834764831845)
     torch.cuda.synchronize()
     end_time = time.time()
-    print(f"Time taken for fmha_decode: {(end_time - start_time) * 1000/10} ms")
+    print(f"Time taken for fmha_decode: {(end_time - start_time) * 1000 / 10} ms")
 
-    position_ids = torch.tensor([[255]], device='cuda')
-    o = sdpa(module, q, k, v, is_causal=None, attention_mask=None, position_ids=position_ids, sliding_window=None, use_cache = True)
+    position_ids = torch.tensor([[255]], device="cuda")
+    o = sdpa(
+        module,
+        q,
+        k,
+        v,
+        is_causal=None,
+        attention_mask=None,
+        position_ids=position_ids,
+        sliding_window=None,
+        use_cache=True,
+    )
     torch.cuda.synchronize()
     start_time = time.time()
     for _ in range(10):
-        o, _ = sdpa(module, q, k, v, is_causal=None, attention_mask=None, position_ids=position_ids, sliding_window=None, use_cache = True)
+        o, _ = sdpa(
+            module,
+            q,
+            k,
+            v,
+            is_causal=None,
+            attention_mask=None,
+            position_ids=position_ids,
+            sliding_window=None,
+            use_cache=True,
+        )
     torch.cuda.synchronize()
     end_time = time.time()
-    print(f"Time taken for sdpa: {(end_time - start_time) * 1000/10} ms")
+    print(f"Time taken for sdpa: {(end_time - start_time) * 1000 / 10} ms")
 
     # torch.testing.assert_close(o1, o, atol=1e-4, rtol=1e-3)

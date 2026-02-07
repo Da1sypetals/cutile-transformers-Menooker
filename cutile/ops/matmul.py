@@ -1,3 +1,6 @@
+# cutile-lsp: on
+
+# cutile-lsp: start
 
 import time
 import cuda.tile as ct
@@ -15,6 +18,20 @@ ConstInt = ct.Constant[int]
 def gemv_split_k_kernel(A, B, C, bias, f32acc, COUNTS,
                           tn: ConstInt, tk: ConstInt,
                           SPLIT_K: ConstInt, act: ConstInt):
+    """
+    <typecheck>
+    Tensor((1, 8960), dtype="float16")
+    Tensor((1536, 8960), dtype="float16")
+    Tensor((1, 1536), dtype="float16")
+    Tensor((1, 1536), dtype="float16")
+    Tensor((1, 1536), dtype="float32")
+    Tensor((12,), dtype="int32")
+    128
+    128
+    16
+    3
+    </typecheck>
+    """
     GROUP_SIZE_M = 1
     M = 1
     N = B.shape[1]
@@ -87,6 +104,22 @@ def swizzle_2d(M, N, TILE_SIZE_M, TILE_SIZE_N, GROUP_SIZE_M):
 
 @ct.kernel(occupancy=ct.ByTarget(sm_120=4))
 def matmul(a, b, c, bias, TILE_M: ct.Constant[int], TILE_N: ct.Constant[int], TILE_K: ct.Constant[int], transb: ct.Constant[bool], act: ct.Constant[int], latencyAB: ct.Constant[int], latencyC: ct.Constant[int], swizzle=ct.Constant[bool]):
+    """
+    <typecheck>
+    Tensor((128, 8960), dtype="float16")
+    Tensor((1536, 8960), dtype="float16")
+    Tensor((128, 1536), dtype="float16")
+    Tensor((128, 1536), dtype="float16")
+    32
+    32
+    128
+    True
+    3
+    4
+    1
+    True
+    </typecheck>
+    """
     M,K = a.shape[0], a.shape[1]
     N = b.shape[1] if not transb else b.shape[0]
     num_tiles_k = ct.cdiv(K, TILE_K)
@@ -152,6 +185,19 @@ def launch_matmul_auto_tune(stream: torch.cuda.Stream, a: torch.Tensor, b: torch
 def matmul_split_k_kernel(A, B, C, LOCKS, COUNTS,
                           tm: ConstInt, tn: ConstInt, tk: ConstInt,
                           SPLIT_K: ConstInt):
+    """
+    <typecheck>
+    Tensor((128, 8960), dtype="float16")
+    Tensor((1536, 8960), dtype="float16")
+    Tensor((128, 1536), dtype="float32")
+    Tensor((48,), dtype="int32")
+    Tensor((48,), dtype="int32")
+    64
+    64
+    64
+    4
+    </typecheck>
+    """
     GROUP_SIZE_M = 8
     M = A.shape[0]
     N = C.shape[1]
@@ -190,6 +236,7 @@ def matmul_split_k_kernel(A, B, C, LOCKS, COUNTS,
     ct.scatter(COUNTS, count_offset, (count + 1) % SPLIT_K)
     ct.atomic_xchg(LOCKS, lock_offset, 0, memory_order=ct.MemoryOrder.RELEASE)
 
+# cutile-lsp: end
 
 locks = None
 def launch_gemm_split_k(stream: torch.cuda.Stream, a: torch.Tensor, b1: torch.Tensor, c: torch.Tensor):

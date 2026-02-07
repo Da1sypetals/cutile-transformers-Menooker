@@ -1,0 +1,10 @@
+{
+    "python.analysis.inlayHints.callArgumentNames": "off",
+    "python.analysis.inlayHints.functionReturnTypes": false,
+    "python.analysis.inlayHints.variableTypes": false,
+    "[python]": {
+        "editor.codeActionsOnSave": {
+            // "source.organizeImports": "always"
+        },
+    }
+}
